@@ -1,5 +1,19 @@
 # adapted env from vertebra to liver navigation
+# cd /~IsaacLab
 # PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH \./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/teleoperation/teleop_se3_agent.py \--enable_cameras --task Isaac-robot-US-guidance-v0 \--num_envs 1
+
+'''
+    keyboard name: Isaac Sim 5.1.0
+----------------------------------------------
+    Toggle gripper (open/close): K
+    Move arm along x-axis: W/S
+    Move arm along y-axis: A/D
+    Move arm along z-axis: Q/E
+    Rotate arm along x-axis: Z/X            
+    Rotate arm along y-axis: T/G
+    Rotate arm along z-axis: C/V
+
+'''
 
 from __future__ import annotations
 
@@ -622,6 +636,7 @@ class roboticUSEnv(DirectRLEnv):
                 self.US_ee_pose_w[:, 0:3],
                 self.US_ee_pose_w[:, 3:7],
             )
+            self._us_for_vis = self.US_slicer.us_img_tensor[..., 0]
 
             US_img = (
                 self.US_slicer.us_img_tensor.permute(0, 3, 1, 2)
@@ -702,7 +717,7 @@ class roboticUSEnv(DirectRLEnv):
 
                 plt.figure("Ultrasound (US)")
                 plt.clf()
-                plt.imshow(us0.cpu(), cmap="gray")
+                plt.imshow(us0, cmap="gray")
                 plt.title(f"US image @ step {self.num_step}")
                 plt.colorbar()
                 plt.pause(0.001)
@@ -743,13 +758,18 @@ class roboticUSEnv(DirectRLEnv):
                 palette = torch.zeros((256,3), dtype=torch.uint8, device=label2d.device)
 
                 palette[0]  = torch.tensor([0,0,0], device=label2d.device)        # background
-               #palette[2]  = torch.tensor([255,255,0], device=label2d.device)    # lung
-                palette[6]  = torch.tensor([255,180,120], device=label2d.device)  # soft tissue 
+                palette[14]  = torch.tensor([255,255,0], device=label2d.device)    # lung
+                palette[2] = torch.tensor([160, 160, 255], device=label2d.device)  # Right Kidney
                 palette[8]  = torch.tensor([0,255,255], device=label2d.device)    # muscle
-                palette[10] = torch.tensor([255,0,255], device=label2d.device)    # organ tissue
+                palette[10] = torch.tensor([255, 165, 0], device=label2d.device)  # organ tissue
                 palette[12] = torch.tensor([144,238,144], device=label2d.device)      # skin / fat
                 palette[13] = torch.tensor([255,0,0], device=label2d.device)      # bone
                 palette[5] = torch.tensor([0,0,200], device=label2d.device)  # main organ class
+                palette[64] = torch.tensor([0, 100, 255], device=label2d.device)  # Portal Vein
+                palette[52] = torch.tensor([160, 82, 45], device=label2d.device)    # aorta
+                palette[63] = torch.tensor([148,0,211], device=label2d.device)      # IVC
+                palette[6] = torch.tensor([139, 69, 19], device=label2d.device)  # stomach
+                palette[4] = torch.tensor([255, 255, 255], device=label2d.device)  # gallbladder
 
 
                 rgb = palette[label2d].detach().cpu().numpy()  # (H,W,3)
@@ -767,16 +787,23 @@ class roboticUSEnv(DirectRLEnv):
                 #plt.imshow(rgb[::-1], interpolation="nearest")
                 plt.title("Convex Label Map (Semantic RGB)")
                 plt.axis("off")
-                import matplotlib.patches as mpatches
+                import matplotlib.patches as mpatches 
                 legend_items = [
-                    mpatches.Patch(color=(1,1,0), label="Lung (ID 2)"),
-                    mpatches.Patch(color=(1,0.7,0.5), label="Soft tissue (ID 6)"),
+                    mpatches.Patch(color=(0, 0, 0), label="Background (ID 0)"),
+                    mpatches.Patch(color=(1,1,0), label="Lower Lung (ID 14)"), # also need to include shadow / remove
+                    mpatches.Patch(color=(160/255, 160/255, 1), label="Right Kidney (ID 2)"),
                     mpatches.Patch(color=(0,1,1), label="Muscle (ID 8)"),
-                    mpatches.Patch(color=(1,0,1), label="Organ tissue (ID 10)"),
+                    mpatches.Patch(color=(1, 165/255, 0), label="Organ tissue (ID 10)"),
                     mpatches.Patch(color=(0.56,0.93,0.56), label="Skin / Fat (ID 12)"),
                     mpatches.Patch(color=(1,0,0), label="Bone / Vertebra (ID 13)"),
-                    mpatches.Patch(color=(0,0,0.6), label="Liver (ID 5)")
-                ]
+                    mpatches.Patch(color=(0,0,0.6), label="Liver (ID 5)"),
+                    mpatches.Patch(color=(0, 100/255, 1), label="Portal Vein (ID 64)"),
+                    mpatches.Patch(color=(0.63,0.32,0.18), label="Aorta (ID 52)"), # you can remove 
+                    mpatches.Patch(color=(148/255, 0, 211/255), label="IVC (ID 63)"),
+                    mpatches.Patch(color=(139/255, 69/255, 19/255), label="Stomach (ID 6)"), # you can remove this 
+                    mpatches.Patch(color=(1, 1, 1), label="Gallbladder (ID 4)") #include spleen / pancreas 
+]
+
                 plt.legend(handles=legend_items,loc="center left",bbox_to_anchor=(1.02, 0.5),frameon=True)
                 plt.pause(0.001)
 
@@ -898,7 +925,7 @@ class roboticUSEnv(DirectRLEnv):
             wandb.log({
                 "liver_fraction": liver_fraction.mean().item()
             })
-        terminated = (liver_fraction > 0.50)
+        terminated = (liver_fraction > 0.99)
 
         time_outs = self.episode_length_buf >= self.max_episode_length - 1
 

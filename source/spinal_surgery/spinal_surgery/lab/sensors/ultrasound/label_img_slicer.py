@@ -115,6 +115,8 @@ class LabelImgSlicer(SurfaceMotionPlanner):
         self.probe_type = getattr(self, "probe_type", "linear")  # "linear" | "convex"
         self.fan_angle_deg = getattr(self, "fan_angle_deg", 60.0)  # degrees
         self.max_depth = getattr(self, "max_depth", 0.12)  # meters
+        self.probe_radius = getattr(self, "probe_radius", 0.04)
+
 
         # cache holder used by USSlicer.slice_rand_maps
         self.human_img_coords = None
@@ -209,7 +211,7 @@ class LabelImgSlicer(SurfaceMotionPlanner):
         # Cartesian image grid (x,z) where z is depth [0..max_depth]
         half_width = max_depth * np.tan(fan_angle / 2.0)  # meters
         x_lin = torch.linspace(-half_width, half_width, W, device=device)  # (W,)
-        probe_radius = 0.04  # meters (adjust)
+        probe_radius = float(getattr(self, "probe_radius", 0.04))
         z_lin = torch.linspace(0.0, max_depth, H, device=device)
 
         x_grid, z_grid = torch.meshgrid(x_lin, z_lin, indexing="ij")  # (W,H)

@@ -6,7 +6,7 @@ robot:
 patient:
   pos: [0.2, 0.0, 0.6]
   euler_yxz: [-90.0, 90.0, 0.0]
-  id_list: ['s0010'] #['s0015', 's0024', 's0028', 's0029', 's0030'] # ['s0010'] # 's0010', 's0014', 's0015'
+  id_list: ['s0030'] #['s0015', 's0024', 's0028', 's0029', 's0030'] # ['s0010'] # 's0010', 's0014', 's0015'
   label_res: 0.0015 # m
   target_anatomy: 'liver'
 
@@ -36,7 +36,7 @@ reward:
 
 sim:
   episode_length: 200
-  patient_xz_range: [[80, 40, 1.0], [200, 240, 3.0]]
+  patient_xz_range: [[50, 40, 1.0], [230, 240, 3.0]]
   patient_xz_init_range: [[80, 40, 1.5], [200, 240, 3.5]]
   if_use_ct: False
   ct_range: [-300, 3000]
@@ -45,11 +45,6 @@ sim:
   vis_int: 20
   vis_seg_map: True
 
-probe:   #i added this part
-  type: convex          # <<< KEY
-  #radius: 60             # mm, typical convex probe
-  fan_angle: 60          # degrees (50–90 common)
-  depth: 0.16            # mm (matches image height)
 
 if_record_traj: True
 record_path: /recordings/robot_US_guidance/

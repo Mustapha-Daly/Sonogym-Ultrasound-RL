@@ -1,28 +1,29 @@
 # total seg to imfusion labels
-1: 12
-2: 6
-3: 6
-4: 12
-5: 5 #liver: for US mode: a 5 should be added : entry in us_cfg.yaml
-7: 12
-8: 12
+1: 10
+2: 2 # right kidney
+3: 10
+4: 4 #gallbladder 
+5: 5 #liver
+6: 6 #stomach 
+7: 7  #Pancreas
+8: 12 
 9: 12
-10: 2
-11: 2
-12: 2
-13: 2
-14: 2
-15: 12
+10: 10
+11: 10
+12: 10
+13: 10
+14: 14 #lung_lower_lobe_right
+15: 10
 16: 12
 17: 12
 18: 12
-19: 12
+19: 19 #duodenum
 20: 12
 21: 12
 22: 12
-23: 6
-24: 6
-25: 13
+23: 10
+24: 10
+25: 13 # Bone/ vertebrae
 26: 13
 27: 13
 28: 13
@@ -49,29 +50,25 @@
 48: 13
 49: 13
 50: 13
-51: 8
+51: 10
 # LEFT kidney
-52: 15
-53: 15
-54: 15
-55: 15
-56: 15
-# RIGHT kidney
-57: 15
-58: 15
-59: 15
-60: 15
-61: 15
-# REMOVE THESE (VERY IMPORTANT)
-# 62–68 → DELETE or remap to background/other
-#62–68 → vessels / hilum / variants
-62: 6
-63: 6
-64: 6
-65: 6
-66: 6
-67: 6
-68: 6
+52: 52 # aorta
+53: 10
+54: 10
+55: 10
+56: 10
+57: 10
+58: 10
+59: 10
+60: 10
+61: 10
+62: 10
+63: 63 #inferior_vena_cava
+64: 64 #portal_vein
+65: 10
+66: 10
+67: 10
+68: 10
 #62: 15
 #63: 15
 #64: 15
@@ -90,7 +87,7 @@
 77: 13
 78: 13
 79: 10
-80: 8
+80: 8 #Muscle 
 81: 8
 82: 8
 83: 8

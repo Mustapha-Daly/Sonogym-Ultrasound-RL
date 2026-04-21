@@ -22,7 +22,7 @@ parser.add_argument("--disable_fabric", action="store_true", default=False)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
-# ------------------------------------------------------------l-----------------
+# -----------------------------------------------------------f-l-----------------
 # Launch Isaac Sim FIRST
 # -----------------------------------------------------------------------------
 #app_launcher = AppLauncher(headless=args_cli.headless)
@@ -57,26 +57,23 @@ def _as_torch(x, device):
     return torch.as_tensor(x, device=device, dtype=torch.float32)
 
 
+# Changed this part so it consideres rotations too
 def _make_actions(delta_pose_raw, device, num_envs):
-    """
-    Map SE(3) keyboard delta to US-guidance action space.
-
-    Keyboard gives:
-        [dx, dy, dz, droll, dpitch, dyaw]
-
-    US guidance expects:
-        [dx, dy, dz]
-    """
     dp = _as_torch(delta_pose_raw, device=device).flatten()
 
-    # Translation only
-    transl = dp[:3]
+    # Full SE(3): [dx, dy, dz, droll, dpitch, dyaw]
+    action = dp[:6]
 
-    # IMPORTANT: scale (keyboard deltas are tiny)
-    transl = 5.0 * transl
+    # action scaling
+    action[:3] = 5.0 * action[:3]  
+    action[3] = 0.0
+    action[4] = 0.0
+    action[5] = 2.5 * action[5]
 
-    # (num_envs, 3)
-    return transl.unsqueeze(0).repeat(num_envs, 1)
+
+
+    return action.unsqueeze(0).repeat(num_envs, 1)
+
 
 
 # -----------------------------------------------------------------------------
@@ -117,6 +114,8 @@ def main():
         with torch.inference_mode():
             # IMPORTANT: advance() returns ONLY ONE value
             delta_pose = teleop_interface.advance()
+            print("raw keyboard delta:", delta_pose)
+
 
             actions = _make_actions(
                 delta_pose_raw=delta_pose,
@@ -141,4 +140,3 @@ if __name__ == "__main__":
     profiler.disable()
     profiler.dump_stats("teleop_stats.prof")
     simulation_app.close()
-

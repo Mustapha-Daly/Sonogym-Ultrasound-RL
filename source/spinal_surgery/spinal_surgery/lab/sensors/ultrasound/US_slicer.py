@@ -102,6 +102,12 @@ class USSlicer(LabelImgSlicer):
 
         self.us_cfg = us_cfg
         self.if_use_ct = if_use_ct
+        probe_cfg = us_cfg.get("probe", {})
+        self.probe_type = probe_cfg.get("type", "convex")
+        self.fan_angle_deg = float(probe_cfg.get("fan_angle", 60.0))
+        self.max_depth = float(probe_cfg.get("depth", 0.16))
+        self.probe_radius = float(probe_cfg.get("radius", 40.0)) / 1000.0  # mm -> m
+
 
         for i in range(self.n_human_types):
             for key, value in label_convert_map.items():

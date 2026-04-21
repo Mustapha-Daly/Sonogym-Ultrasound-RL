@@ -127,62 +127,44 @@ class SurfaceMotionPlanner(HumanFrameViewer):
 
 
     def compute_world_ee_pose_from_cmd(self, world_to_human_pos, world_to_human_rot):
-            '''
-            compute world ee pose from human frame command
-            world_to_human_pos: (num_envs, 3)
-            world_to_human_rot: (num_envs, 4)
-            '''
-        
+        '''
+        compute world ee pose from human frame command
+        world_to_human_pos: (num_envs, 3)
+        world_to_human_rot: (num_envs, 4)
+        '''
+
         # TODO: make a kernel for this
         for i in range(self.n_human_types):
-            cur_x = self.current_x_z_x_angle_cmd[i::self.n_human_types, 0] # (num_envs / n, 3)
-            cur_z = self.current_x_z_x_angle_cmd[i::self.n_human_types, 1] # (num_envs / n, 3)
-            
-            self.target_z_axis[i::self.n_human_types, :] = self.surface_normal_list[i][cur_x.int(), cur_z.int()] # (num_envs / n, 3)
+            cur_x = self.current_x_z_x_angle_cmd[i::self.n_human_types, 0]
+            cur_z = self.current_x_z_x_angle_cmd[i::self.n_human_types, 1]
 
-            # position assign
+            self.target_z_axis[i::self.n_human_types, :] = self.surface_normal_list[i][cur_x.int(), cur_z.int()]
+
             target_y = self.surface_map_list[i][cur_x.int(), cur_z.int()]
             self.target_position[i::self.n_human_types, 0] = cur_x
             self.target_position[i::self.n_human_types, 1] = target_y
             self.target_position[i::self.n_human_types, 2] = cur_z
 
-
         self.target_x_axis_proj[:, 0] = torch.cos(self.current_x_z_x_angle_cmd[:, 2])
         self.target_x_axis_proj[:, 1] = 0
         self.target_x_axis_proj[:, 2] = torch.sin(self.current_x_z_x_angle_cmd[:, 2])
 
-        target_y_axis = torch.cross(self.target_z_axis, self.target_x_axis_proj, dim=-1) # (num_envs / n, 3)
+        target_y_axis = torch.cross(self.target_z_axis, self.target_x_axis_proj, dim=-1)
         target_x_axis = torch.cross(target_y_axis, self.target_z_axis, dim=-1)
 
-        # rotation assign # adjust roll
         self.target_rot_mat[:, :, 0] = target_x_axis
         self.target_rot_mat[:, :, 1] = target_y_axis * torch.cos(self.roll_adj) + self.target_z_axis * torch.sin(self.roll_adj)
         self.target_rot_mat[:, :, 2] = self.target_z_axis * torch.cos(self.roll_adj) - target_y_axis * torch.sin(self.roll_adj)
 
-        # target_rot_mat_wp = wp.from_torch(self.target_rot_mat, wp.mat33)
-        # wp.launch(
-        #     kernel=my_quat_from_matrix,
-        #     dim=self.num_envs,
-        #     inputs=[
-        #         target_rot_mat_wp, self.target_quat_wp
-        #     ],
-        #     device=self.device,
-        #     record_tape=False
-        # )
-        
-        # self.human_to_ee_target_quat = wp.to_torch(self.target_quat_wp)[:, [3, 0, 1, 2]]
-
         self.human_to_ee_target_quat = quat_from_matrix_optimize(self.target_rot_mat)
-        # human_to_ee_target_quat = torch.zeros((self.num_envs, 4), device=self.device)
         self.human_to_ee_target_pos = self.target_position * self.label_res - self.target_rot_mat[:, :, 2] * self.height
 
-
-        # get world to human position
         world_to_ee_target_pos, world_to_ee_target_rot = combine_frame_transforms(
             world_to_human_pos, world_to_human_rot, self.human_to_ee_target_pos, self.human_to_ee_target_quat
         )
 
         return world_to_ee_target_pos, world_to_ee_target_rot
+
     
     
     def update_cmd(self, d_x_z_x_angle):
