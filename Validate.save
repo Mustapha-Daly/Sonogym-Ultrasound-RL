@@ -1,0 +1,12 @@
+import nibabel as nib
+import numpy as np
+
+path = "/home/yue/ws/sonogym/SonoGym/source/spinal_surgery/spinal_surgery/assets/data/HumanModels/selected_dataset_stl/s0024/combined_label_map.nii.gz"
+
+data = nib.load(path).get_fdata().astype(int)
+
+kidney_labels = list(range(52,69))
+
+present = np.intersect1d(np.unique(data), kidney_labels)
+
+print("Kidney labels found in volume:", present)
