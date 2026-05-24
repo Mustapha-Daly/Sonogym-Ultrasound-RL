@@ -18,7 +18,7 @@ import numpy as np
 import trimesh
 from ruamel.yaml import YAML
 
-PATIENT_DIR = Path("/home/yue/ws/sonogym/SonoGym/source/spinal_surgery/spinal_surgery/assets/data/HumanModels/selected_dataset_stl/s0010")
+PATIENT_DIR = Path("/home/yue/ws/sonogym/SonoGym/source/spinal_surgery/spinal_surgery/assets/data/HumanModels/selected_dataset_stl/s0024")
 LABELMAP_PATH = PATIENT_DIR / "combined_label_map.nii.gz"
 CONVERSION_YAML = Path("/home/yue/ws/sonogym/SonoGym/source/spinal_surgery/spinal_surgery/lab/sensors/cfgs/label_conversion.yaml")
 

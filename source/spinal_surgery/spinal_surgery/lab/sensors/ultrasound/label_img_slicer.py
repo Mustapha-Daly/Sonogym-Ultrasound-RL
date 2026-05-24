@@ -190,7 +190,7 @@ class LabelImgSlicer(SurfaceMotionPlanner):
         for b in range(self.label_img_tensor.shape[0]):
             for e in range(self.label_img_tensor.shape[3]):
                 slice_2d = self.label_img_tensor[b, :, :, e]
-                self.label_img_tensor[b, :, :, e] = self.bilateral_filter_pytorch(slice_2d)
+                #self.label_img_tensor[b, :, :, e] = self.bilateral_filter_pytorch(slice_2d)
 
         self.check_collision(self.label_img_tensor, self.ct_img_tensor)
 
@@ -269,7 +269,7 @@ class LabelImgSlicer(SurfaceMotionPlanner):
         for b in range(self.label_img_tensor.shape[0]):
             for e in range(self.label_img_tensor.shape[3]):
                 slice_2d = self.label_img_tensor[b, :, :, e]
-                self.label_img_tensor[b, :, :, e] = self.bilateral_filter_pytorch(slice_2d)
+                #self.label_img_tensor[b, :, :, e] = self.bilateral_filter_pytorch(slice_2d)
                 
         self.check_collision(self.label_img_tensor, self.ct_img_tensor)
 
@@ -359,7 +359,7 @@ class LabelImgSlicer(SurfaceMotionPlanner):
             #denom = np.max(combined_img_np) + 1e-8
             img = combined_img_np
             img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-            plt.imshow(img.T, cmap="gray")
+            plt.imshow(img.T[::-1], cmap="gray")
             #plt.imshow((combined_img_np.T / denom * 255).astype(np.uint8), cmap="gray")
             plt.pause(0.0001)
 

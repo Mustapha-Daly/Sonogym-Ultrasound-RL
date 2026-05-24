@@ -1,6 +1,7 @@
 # adapted env from vertebra to liver navigation
-# cd /~IsaacLab
-# PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH \./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/teleoperation/teleop_se3_agent.py \--enable_cameras --task Isaac-robot-US-guidance-v0 \--num_envs 1
+# cd ~/IsaacLab
+# PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH ./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/teleoperation/teleop_se3_agent.py --enable_cameras --task Isaac-robot-US-guidance-v0 --num_envs 1
+
 
 '''
     keyboard name: Isaac Sim 5.1.0
@@ -16,6 +17,7 @@
 '''
 
 from __future__ import annotations
+from isaaclab.utils.math import matrix_from_quat
 
 
 import torch
@@ -28,6 +30,7 @@ from isaaclab.assets import (
     Articulation,
     RigidObject,
 )
+
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 #for new file
 from spinal_surgery.lab.sensors.ultrasound.us_clarity import us_clarity_score
@@ -127,14 +130,7 @@ elif scene_cfg["robot"]["type"] == "fr3":
             float(robot_cfg["pos"][2]),
         ),  # ((0.0, -0.75, 0.4))
     )
-def _orient_convex_hw(self, img_wh: torch.Tensor) -> torch.Tensor:
-    # convert (B,W,H) → (B,H,W)
-    img_hw = img_wh.permute(0, 2, 1).contiguous()
 
-    # flip vertically so probe is at the top
-    img_hw = torch.flip(img_hw, dims=[1])
-
-    return img_hw
 # patient
 patient_cfg = scene_cfg["patient"]
 quat = R.from_euler("yxz", patient_cfg["euler_yxz"], degrees=True).as_quat()
@@ -211,7 +207,7 @@ class roboticUSEnvCfg(DirectRLEnvCfg):
     decimation = 2
     episode_length_s = scene_cfg["sim"]["episode_length"]  # 300
     action_scale = 1
-    action_space = 3
+    action_space = 4
     observation_space = [3, 240, 200] #[1, 150, 200]
     state_space = 0
     observation_scale = scene_cfg["observation"]["scale"]
@@ -235,8 +231,19 @@ class roboticUSEnvCfg(DirectRLEnvCfg):
 
 class roboticUSEnv(DirectRLEnv):
     cfg: roboticUSEnvCfg
-    def _warp_label_to_convex(self, img: torch.Tensor, fan_angle_deg: float = 60.0) -> torch.Tensor:
 
+    def _lock_cmd_to_plane_angle(self, cmd: torch.Tensor) -> torch.Tensor:
+        """Keep the probe slice angle fixed when the liver task is locked."""
+        if not self.lock_probe_x_angle:
+            return cmd
+        cmd = cmd.clone()
+        cmd[:, 2] = self.coronal_x_angle_rad
+        return cmd
+
+    def _warp_label_to_convex(self, img: torch.Tensor, fan_angle_deg: float = 0.0) -> torch.Tensor:
+        if fan_angle_deg == 0:
+            # Skip warping—keep rectangular slice
+            return img.permute(0, 2, 1).contiguous()  # just reorient (B,W,H)→(B,H,W)
         B, C, H, W = img.shape
         device = img.device
 
@@ -376,9 +383,15 @@ class roboticUSEnv(DirectRLEnv):
             sim_mode=scene_cfg["sim"]["us"],
             us_generative_cfg=us_generative_cfg,
         )
-        self.US_slicer.current_x_z_x_angle_cmd = (
-            self.init_cmd_pose_min + self.init_cmd_pose_max
-        ) / 2
+        self.coronal_x_angle_rad = float(
+            scene_cfg["motion_planning"].get("coronal_x_angle_rad", 0.5 * np.pi)
+        )
+        self.lock_probe_x_angle = bool(
+            scene_cfg["motion_planning"].get("lock_probe_x_angle", False)
+        )
+        self.US_slicer.current_x_z_x_angle_cmd = self._lock_cmd_to_plane_angle(
+            (self.init_cmd_pose_min + self.init_cmd_pose_max) / 2
+        )
 
         self.human_world_poses = (
             self.human.data.root_state_w
@@ -386,6 +399,7 @@ class roboticUSEnv(DirectRLEnv):
 
         # construct ground truth motion generator
         motion_plan_cfg = scene_cfg["motion_planning"]
+        self.max_roll_adj = motion_plan_cfg.get("max_roll_adj", 0.5)
         self.max_action = torch.tensor(
             scene_cfg["action"]["max_action"], device=self.sim.device
         ).reshape((1, -1))
@@ -394,6 +408,7 @@ class roboticUSEnv(DirectRLEnv):
             .reshape((1, -1))
             .repeat(self.scene.num_envs, 1)
         )
+        self.goal_cmd_pose = self._lock_cmd_to_plane_angle(self.goal_cmd_pose)
         self.use_vertebra_goal = motion_plan_cfg["use_vertebra_goal"]
         self.gt_motion_generator = GTDiscreteMotionGenerator(
             goal_cmd_pose=self.goal_cmd_pose,
@@ -481,6 +496,7 @@ class roboticUSEnv(DirectRLEnv):
         )
 
         US_target_2d = torch.cat([US_target_2d_pos, US_target_2d_angle], dim=-1)
+        US_target_2d = self._lock_cmd_to_plane_angle(US_target_2d)
 
         self.goal_cmd_pose = US_target_2d
 
@@ -536,7 +552,8 @@ class roboticUSEnv(DirectRLEnv):
                 random_choice=False,
                 scale=(label_res, label_res, label_res),
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    disable_gravity=False,
+                    kinematic_enabled=True,
+                    disable_gravity=True,
                     retain_accelerations=False,
                     linear_damping=0.0,
                     angular_damping=0.0,
@@ -609,10 +626,35 @@ class roboticUSEnv(DirectRLEnv):
             img_hw = img_wh.permute(0, 2, 1, 3).contiguous()
 
         # flip vertically so depth increases downward
-        img_hw = torch.flip(img_hw, dims=[1])
+       # img_hw = torch.flip(img_hw, dims=[1])
 
         return img_hw
+    
+    def _apply_superficial_bone_shadow(self, label_hw: torch.Tensor) -> torch.Tensor:
+        B, H, W = label_hw.shape
+        shadowed = label_hw.clone()
+        shadow = torch.zeros(B, H, W, dtype=torch.bool, device=label_hw.device)
+        top_rows = int(0.4 * H)
+        rows = torch.arange(H, device=label_hw.device).view(1, H, 1).expand(B, H, W)
 
+        for lbl in [13, 15]:
+            seed = (label_hw == lbl).float()
+            seed[:, top_rows:, :] = 0.0
+
+            has_seed = seed.sum(dim=1) > 0
+            first_occ = torch.argmax(seed, dim=1)
+            first_occ_exp = first_occ.unsqueeze(1).expand(B, H, W)
+            has_seed_exp = has_seed.unsqueeze(1).expand(B, H, W)
+
+            col_shadow = (rows > first_occ_exp) & has_seed_exp   # no upper bound → reaches bottom
+            shadow |= col_shadow
+
+        shadow &= ~((label_hw == 13) | (label_hw == 15))
+        shadowed[shadow] = 0
+        return shadowed
+
+    
+  
     def _get_observations(self) -> dict:
         # -------------------------------------------------
         # Pose extraction
@@ -661,29 +703,18 @@ class roboticUSEnv(DirectRLEnv):
             observations = {"policy": CT_img}
 
         elif self.observation_mode == "seg":
-        # 1) Compute label slice (for RL)
             self.US_slicer.slice_label_img(
                 self.world_to_human_pos,
                 self.world_to_human_rot,
                 self.US_ee_pose_w[:, 0:3],
                 self.US_ee_pose_w[:, 3:7],
             )
-            # (B, W, H) integer labels
-            label_wh = self.US_slicer.label_img_tensor[:, :, :, 0].to(torch.float32)
 
-            # (B, H, W) oriented correctly
-            label_hw = self._orient_convex_hw(label_wh)
-
-            # RL expects (B, C, H, W)
-            seg_img = label_hw.unsqueeze(1)  # (B,1,H,W)
-
-            observations = {"policy": seg_img * self.cfg.observation_scale}
-
-            # Use same tensor for reward/navigation
-            self._label_for_task = label_hw.to(torch.long)
-
-        else:
-            raise ValueError("Invalid observation mode")
+            label_img = (
+                self.US_slicer.label_img_tensor.permute(0, 3, 1, 2)
+                * self.cfg.observation_scale
+            )
+            observations = {"policy": label_img}
 
         # -------------------------------------------------
         # Semantic navigation logic
@@ -732,7 +763,8 @@ class roboticUSEnv(DirectRLEnv):
                 label_wh = self.US_slicer.label_img_tensor[:, :, :, 0].to(torch.long)
 
                 # apply SAME orientation as RL
-                label_hw = self._orient_convex_hw(label_wh)  # (B,H,W)
+                label_hw = self._orient_convex_hw(label_wh)
+                label_hw = self._apply_superficial_bone_shadow(label_hw)
 
                 # pick env 0 for plotting
                 label2d = label_hw[0]  # (H,W)
@@ -751,6 +783,19 @@ class roboticUSEnv(DirectRLEnv):
                 if self.num_step % 10 == 0:
                     u = torch.unique(label2d)
                     print("Unique IDs in CURRENT slice:", u.detach().cpu().tolist())
+                    if self.num_step % 10 == 0:
+                        cart_mask = (label2d == 15)
+                        liver_mask = (label2d == 5)
+                        if cart_mask.any():
+                            cart_rows = torch.where(cart_mask)[0]
+                            print(f"  Cartilage H rows: min={cart_rows.min().item()}, max={cart_rows.max().item()}")
+                        if liver_mask.any():
+                            liver_rows = torch.where(liver_mask)[0]
+                            print(f"  Liver H rows:     min={liver_rows.min().item()}, max={liver_rows.max().item()}")
+                            
+                   
+
+
                     for k in u.detach().cpu().tolist():
                         cnt = (label2d == k).sum().item()
                         print(f"  id={k:>3} pixels={cnt}")
@@ -758,7 +803,7 @@ class roboticUSEnv(DirectRLEnv):
                 palette = torch.zeros((256,3), dtype=torch.uint8, device=label2d.device)
 
                 palette[0]  = torch.tensor([0,0,0], device=label2d.device)        # background
-                palette[14]  = torch.tensor([255,255,0], device=label2d.device)    # lung
+                palette[1]  = torch.tensor([255,255,0], device=label2d.device)    # spleen
                 palette[2] = torch.tensor([160, 160, 255], device=label2d.device)  # Right Kidney
                 palette[8]  = torch.tensor([0,255,255], device=label2d.device)    # muscle
                 palette[10] = torch.tensor([255, 165, 0], device=label2d.device)  # organ tissue
@@ -766,10 +811,10 @@ class roboticUSEnv(DirectRLEnv):
                 palette[13] = torch.tensor([255,0,0], device=label2d.device)      # bone
                 palette[5] = torch.tensor([0,0,200], device=label2d.device)  # main organ class
                 palette[64] = torch.tensor([0, 100, 255], device=label2d.device)  # Portal Vein
-                palette[52] = torch.tensor([160, 82, 45], device=label2d.device)    # aorta
-                palette[63] = torch.tensor([148,0,211], device=label2d.device)      # IVC
-                palette[6] = torch.tensor([139, 69, 19], device=label2d.device)  # stomach
+                palette[51] = torch.tensor([148,0,211], device=label2d.device)      # IVC
+                palette[7] = torch.tensor([139, 69, 19], device=label2d.device)  # pancreas
                 palette[4] = torch.tensor([255, 255, 255], device=label2d.device)  # gallbladder
+                palette[15] = torch.tensor([255, 105, 180], device=label2d.device)  # costal cartilages
 
 
                 rgb = palette[label2d].detach().cpu().numpy()  # (H,W,3)
@@ -781,8 +826,8 @@ class roboticUSEnv(DirectRLEnv):
 
                 plt.figure("Convex Semantic Label")
                 plt.clf()
-                plt.imshow(ct_hw[::-1], cmap="gray")
-                plt.imshow(rgb[::-1], alpha=0.5, interpolation="nearest")
+                plt.imshow(ct_hw , cmap="gray")
+                plt.imshow(rgb ,alpha=1.0, interpolation="nearest")
                 #plt.imshow(rgb, interpolation="nearest")
                 #plt.imshow(rgb[::-1], interpolation="nearest")
                 plt.title("Convex Label Map (Semantic RGB)")
@@ -790,7 +835,7 @@ class roboticUSEnv(DirectRLEnv):
                 import matplotlib.patches as mpatches 
                 legend_items = [
                     mpatches.Patch(color=(0, 0, 0), label="Background (ID 0)"),
-                    mpatches.Patch(color=(1,1,0), label="Lower Lung (ID 14)"), # also need to include shadow / remove
+                    mpatches.Patch(color=(1,1,0), label="Spleen (ID 1)"), 
                     mpatches.Patch(color=(160/255, 160/255, 1), label="Right Kidney (ID 2)"),
                     mpatches.Patch(color=(0,1,1), label="Muscle (ID 8)"),
                     mpatches.Patch(color=(1, 165/255, 0), label="Organ tissue (ID 10)"),
@@ -798,21 +843,52 @@ class roboticUSEnv(DirectRLEnv):
                     mpatches.Patch(color=(1,0,0), label="Bone / Vertebra (ID 13)"),
                     mpatches.Patch(color=(0,0,0.6), label="Liver (ID 5)"),
                     mpatches.Patch(color=(0, 100/255, 1), label="Portal Vein (ID 64)"),
-                    mpatches.Patch(color=(0.63,0.32,0.18), label="Aorta (ID 52)"), # you can remove 
-                    mpatches.Patch(color=(148/255, 0, 211/255), label="IVC (ID 63)"),
-                    mpatches.Patch(color=(139/255, 69/255, 19/255), label="Stomach (ID 6)"), # you can remove this 
-                    mpatches.Patch(color=(1, 1, 1), label="Gallbladder (ID 4)") #include spleen / pancreas 
-]
-
+                    mpatches.Patch(color=(148/255, 0, 211/255), label="HEART (ID 51)"),
+                    mpatches.Patch(color=(139/255, 69/255, 19/255), label="Pancreas (ID 7)"), 
+                    mpatches.Patch(color=(1, 1, 1), label="Gallbladder (ID 4)"), 
+                    mpatches.Patch(color=(1, 105/255, 180/255), label="Costal Cartilages (ID 15)"),
+                ]
                 plt.legend(handles=legend_items,loc="center left",bbox_to_anchor=(1.02, 0.5),frameon=True)
                 plt.pause(0.001)
+
+            elif self.observation_mode == "CT":
+                ct_wh = self.US_slicer.ct_img_tensor[..., 0]          # (B, W, H)
+                ct_hw = self._orient_convex_hw(ct_wh)[0].detach().cpu().numpy()  # (H, W)
+                ct_hw = (ct_hw - ct_hw.min()) / (ct_hw.max() - ct_hw.min() + 1e-6)
+
+                plt.figure("CT Slice")
+                plt.clf()
+                plt.imshow(ct_hw, cmap="gray")
+                plt.title(f"CT slice @ step {self.num_step}")
+                plt.colorbar()
+                plt.pause(0.001)
+            # in _get_observations:
+            x_cmd = self.US_slicer.current_x_z_x_angle_cmd[0, 0].int()
+            z_cmd = self.US_slicer.current_x_z_x_angle_cmd[0, 1].int()
+            normal_human = self.US_slicer.surface_normal_list[0][x_cmd, z_cmd]
+
+            
+            R = matrix_from_quat(self.world_to_human_rot[0:1])[0]   # (3,3)
+            normal_world = (R @ normal_human).cpu().numpy()
+            robot_pos    = self.robot.data.root_state_w[0, 0:3].cpu().numpy()
+            patient_pos  = self.world_to_human_pos[0].cpu().numpy()
+            vec_robot_to_patient = patient_pos - robot_pos
+            x_cmd = self.US_slicer.current_x_z_x_angle_cmd[0, 0].int()
+            z_cmd = self.US_slicer.current_x_z_x_angle_cmd[0, 1].int()
+            print(f"probe x={x_cmd.item()}  z={z_cmd.item()}")   # ← add here
+            normal_human = self.US_slicer.surface_normal_list[0][x_cmd, z_cmd]
+
+
+          
 
         return observations
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        # if action is 6 dim (SE), convert to 3 dim (xz pos + y rot)
+        # Se3Keyboard.advance() returns [x, y, z, rx, ry, rz].
+        # This task uses tangential probe motion (local x/y) and in-plane
+        # probe rotation (local z / rz) to change the slice angle.
         if actions.shape[-1] == 6:
-            actions = actions[:, [0, 2, 5]]
+            actions = actions[:, [0, 1, 3, 5]]
         # update the target command
         # actions = torch.zeros_like(actions).to(self.sim.device)
         # actions[:, 0] = 1
@@ -825,8 +901,12 @@ class roboticUSEnv(DirectRLEnv):
         else:
             raise ValueError("Invalid action mode")
 
+        if self.lock_probe_x_angle:
+            actions = actions.clone()
+            actions[:, 2] = 0.0
+
         self.actions = actions
-        # actions: dx, dz: in image frame
+        # actions: tangential x/y slide in the probe frame
         human_to_ee_pos, human_to_ee_quat = subtract_frame_transforms(
             self.world_to_human_pos,
             self.world_to_human_rot,
@@ -835,11 +915,17 @@ class roboticUSEnv(DirectRLEnv):
         )
         human_to_ee_rot_mat = matrix_from_quat(human_to_ee_quat)
         dx_dz_human = (
-            actions[:, 0].unsqueeze(1) * human_to_ee_rot_mat[:, :, 0]
-            + actions[:, 1].unsqueeze(1) * human_to_ee_rot_mat[:, :, 1]
+            actions[:, 0].unsqueeze(1) * human_to_ee_rot_mat[:, :, 0] # EE X axis in human frame
+            + actions[:, 1].unsqueeze(1) * human_to_ee_rot_mat[:, :, 1] # EE Y axis in human frame
         )
-        cmd = torch.cat([dx_dz_human[:, [0, 2]], actions[:, 2:3]], dim=-1)
+        cmd = torch.cat([dx_dz_human[:, [0, 2]], actions[:, 2:3]], dim=-1) #delta angle around EE Z axis (in human frame)
         self.US_slicer.update_cmd(cmd)
+        self.US_slicer.roll_adj += actions[:, 3:4]
+        self.US_slicer.roll_adj = torch.clamp(
+            self.US_slicer.roll_adj,
+            min=-self.max_roll_adj,
+            max=self.max_roll_adj,
+        )
 
         # compute desired world to ee pose
         world_to_ee_target_pos, world_to_ee_target_rot = (
@@ -1065,9 +1151,13 @@ class roboticUSEnv(DirectRLEnv):
         min_init = self.init_cmd_pose_min
         max_init = self.init_cmd_pose_max
         cmd_target_poses = cmd_target_poses * (max_init - min_init) + min_init
+        cmd_target_poses = self._lock_cmd_to_plane_angle(cmd_target_poses)
         # compute 3d target poses
         self.US_slicer.update_cmd(
             cmd_target_poses - self.US_slicer.current_x_z_x_angle_cmd
+        )
+        self.US_slicer.current_x_z_x_angle_cmd = self._lock_cmd_to_plane_angle(
+            self.US_slicer.current_x_z_x_angle_cmd
         )
         world_to_ee_init_pos, world_to_ee_init_rot = (
             self.US_slicer.compute_world_ee_pose_from_cmd(

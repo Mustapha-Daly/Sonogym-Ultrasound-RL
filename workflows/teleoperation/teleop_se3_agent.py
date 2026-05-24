@@ -61,14 +61,15 @@ def _as_torch(x, device):
 def _make_actions(delta_pose_raw, device, num_envs):
     dp = _as_torch(delta_pose_raw, device=device).flatten()
 
-    # Full SE(3): [dx, dy, dz, droll, dpitch, dyaw]
     action = dp[:6]
 
     # action scaling
-    action[:3] = 5.0 * action[:3]  
-    action[3] = 0.0
-    action[4] = 0.0
-    action[5] = 2.5 * action[5]
+    action[0] = 4.0 * action[0]  
+    action[1] = 4.0 * action[1]  
+    action[2] = 4.0 * action[2]  
+    action[3] = 0.5 * action[3]
+    action[4] = 0.5 * action[4]
+    action[5] = 0.5 * action[5]
 
 
 
@@ -114,8 +115,7 @@ def main():
         with torch.inference_mode():
             # IMPORTANT: advance() returns ONLY ONE value
             delta_pose = teleop_interface.advance()
-            print("raw keyboard delta:", delta_pose)
-
+            
 
             actions = _make_actions(
                 delta_pose_raw=delta_pose,

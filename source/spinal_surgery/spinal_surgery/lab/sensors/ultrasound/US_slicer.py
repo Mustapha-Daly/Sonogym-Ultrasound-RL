@@ -34,8 +34,8 @@ class USSlicer(LabelImgSlicer):
         label_res=0.0015,
         max_distance=0.03,  # [m]
         body_label=120,
-        height=0.13,
-        height_img=0.133,  # 0.133
+        height=0.12,
+        height_img=0.120,  # 0.133
         visualize=True,
         plane_axes={"h": [0, 0, 1], "w": [1, 0, 0]},
         sim_mode="conv",

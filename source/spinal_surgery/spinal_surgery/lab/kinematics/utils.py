@@ -14,7 +14,7 @@ def construct_highest_y_array(label_map, label):
     return highest_y_array
 
 
-def construct_boundary_normals_array_aligned(label_map, y_array, label, align_y=1.0, smoothing=True):
+def construct_boundary_normals_array_aligned(label_map, y_array, label, align_y=-1.0, smoothing=True):
     X, Y, Z = label_map.shape
     normals = compute_boundary_normals((label_map == label).float(), smoothing)
     normals_array = torch.zeros((X, Z, 3), dtype=torch.float32, device=label_map.device)

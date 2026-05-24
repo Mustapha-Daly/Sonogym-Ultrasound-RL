@@ -1,23 +1,23 @@
 # total seg to imfusion labels
-1: 10
+1: 1  #spleen
 2: 2 # right kidney
 3: 10
 4: 4 #gallbladder 
 5: 5 #liver
-6: 6 #stomach 
+6: 10 #stomach 
 7: 7  #Pancreas
 8: 12 
-9: 12
+9: 10
 10: 10
 11: 10
 12: 10
 13: 10
-14: 14 #lung_lower_lobe_right
+14: 10 #lung_lower_lobe_right
 15: 10
 16: 12
 17: 12
 18: 12
-19: 19 #duodenum
+19: 10 #duodenum
 20: 12
 21: 12
 22: 12
@@ -50,9 +50,9 @@
 48: 13
 49: 13
 50: 13
-51: 10
+51: 51
 # LEFT kidney
-52: 52 # aorta
+52: 10 # aorta
 53: 10
 54: 10
 55: 10
@@ -124,7 +124,7 @@
 114: 13
 115: 13
 116: 13
-117: 13
+117: 15
 120: 12
 
 
