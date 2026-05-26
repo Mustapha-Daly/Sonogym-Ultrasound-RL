@@ -43,3 +43,7 @@ source/spinal_surgery/spinal_surgery/assets/data/*
 models/*
 lerobot-dataset/*
 source/spinal_surgery/spinal_surgery/recordings/*
+models/
+source/spinal_surgery/spinal_surgery/assets/
+source/spinal_surgery/spinal_surgery.egg-info/
+__pycache__/
