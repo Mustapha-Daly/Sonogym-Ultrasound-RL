@@ -1,4 +1,5 @@
 # adapted env from vertebra to liver navigation
+# /isaaacsim
 # cd ~/IsaacLab
 # PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH ./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/teleoperation/teleop_se3_agent.py --enable_cameras --task Isaac-robot-US-guidance-v0 --num_envs 1
 
