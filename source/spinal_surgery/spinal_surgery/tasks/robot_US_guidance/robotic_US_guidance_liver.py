@@ -635,7 +635,7 @@ class roboticUSEnv(DirectRLEnv):
         B, H, W = label_hw.shape
         shadowed = label_hw.clone()
         shadow = torch.zeros(B, H, W, dtype=torch.bool, device=label_hw.device)
-        top_rows = int(0.4 * H)
+        top_rows = int(0.4 * H) #only apply shadow in the top 40% of the image, where superficial bones are likely to appear    
         rows = torch.arange(H, device=label_hw.device).view(1, H, 1).expand(B, H, W)
 
         for lbl in [13, 15]:
@@ -647,7 +647,8 @@ class roboticUSEnv(DirectRLEnv):
             first_occ_exp = first_occ.unsqueeze(1).expand(B, H, W)
             has_seed_exp = has_seed.unsqueeze(1).expand(B, H, W)
 
-            col_shadow = (rows > first_occ_exp) & has_seed_exp   # no upper bound → reaches bottom
+            col_shadow = (rows > first_occ_exp) & has_seed_exp   # shadow every pixel that is below the first seed row
+
             shadow |= col_shadow
 
         shadow &= ~((label_hw == 13) | (label_hw == 15))
@@ -784,23 +785,8 @@ class roboticUSEnv(DirectRLEnv):
                 if self.num_step % 10 == 0:
                     u = torch.unique(label2d)
                     print("Unique IDs in CURRENT slice:", u.detach().cpu().tolist())
-                    if self.num_step % 10 == 0:
-                        cart_mask = (label2d == 15)
-                        liver_mask = (label2d == 5)
-                        if cart_mask.any():
-                            cart_rows = torch.where(cart_mask)[0]
-                            print(f"  Cartilage H rows: min={cart_rows.min().item()}, max={cart_rows.max().item()}")
-                        if liver_mask.any():
-                            liver_rows = torch.where(liver_mask)[0]
-                            print(f"  Liver H rows:     min={liver_rows.min().item()}, max={liver_rows.max().item()}")
-                            
-                   
-
-
-                    for k in u.detach().cpu().tolist():
-                        cnt = (label2d == k).sum().item()
-                        print(f"  id={k:>3} pixels={cnt}")
-
+                    
+                
                 palette = torch.zeros((256,3), dtype=torch.uint8, device=label2d.device)
 
                 palette[0]  = torch.tensor([0,0,0], device=label2d.device)        # background

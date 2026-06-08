@@ -162,73 +162,62 @@ class USSimulatorConv:
 
     # ------------------------------------------------------------------
     # Correct convex geometry warp (sector) with dtype-safe grid_sample
-    # ------------------------------------------------------------------
     def apply_convex_geometry(self, img: torch.Tensor) -> torch.Tensor:
         """
-        img: (N, H, W) - can be float US intensities OR integer label ids
-        returns: (N, H, W) - sector-warped image
+        img: (N, H, W) - rectangular Cartesian slice (H=depth, W=lateral)
+        returns: (N, H, W) - convex-probe fan shape.
 
-        Notes:
-        - Always uses nearest sampling (good for label maps and fast).
-        - Builds a polar sampling grid and maps it into the rectangular input coordinates.
-        - Casts to float before grid_sample to avoid CUDA Byte/Int error.
+        r0 is the normalised probe radius (probe face = arc at distance r0 from the
+        virtual apex above the image).  r0=0 → sharp point (phased-array).
+        r0=2 → probe face is ~67% of bottom width (typical convex-probe look).
+        Set us_cfg["probe_radius_norm"] to override the default.
         """
         assert img.ndim == 3, f"expected (N,H,W), got {tuple(img.shape)}"
         N, H, W = img.shape
         device = img.device
 
-        # Read params
-        fan_angle = float(self.us_cfg.get("fan_angle", self.fan_angle_deg))
-        max_depth = float(self.us_cfg.get("max_depth", self.max_depth))  # normalized
+        probe_cfg    = self.us_cfg.get("probe", {})
+        fan_angle    = float(probe_cfg.get("fan_angle", self.fan_angle_deg))
+        # r0: normalised radius — top_width / bottom_width = r0 / (r0 + 1)
+        # Default 2.0 → top ≈ 67 % of bottom, matches a typical curvilinear probe image.
+        r0           = float(self.us_cfg.get("probe_radius_norm",
+                             probe_cfg.get("radius_norm", 2.0)))
 
-        # Output coordinates: depth r in [0..1], angle theta in [-a/2..a/2]
-        theta = torch.linspace(-fan_angle / 2.0, fan_angle / 2.0, W, device=device) * torch.pi / 180.0
-        r = torch.linspace(0.0, 1.0, H, device=device)  # normalized depth
+        half_fan_rad = fan_angle * 0.5 * (torch.pi / 180.0)
+        sin_half     = float(torch.sin(torch.tensor(half_fan_rad, device=device)))
 
-        R, Theta = torch.meshgrid(r, theta, indexing="ij")  # (H,W)
+        # Lateral extent at the bottom arc: (r0 + 1) * sin(half_fan)
+        x_max = (r0 + 1.0) * sin_half
 
-        # Sector coordinates (x lateral, z depth), both normalized by r
-        # x in [-sin(a/2), +sin(a/2)] scaled by R
-        # z in [0,1] scaled by R
-        X = R * torch.sin(Theta)
-        Z = R * torch.cos(Theta)
+        # Cartesian output canvas: x ∈ [-x_max, +x_max], z ∈ [0, 1]
+        x_coords = torch.linspace(-x_max, x_max, W, device=device)
+        z_coords = torch.linspace(0.0, 1.0,       H, device=device)
+        Z, X = torch.meshgrid(z_coords, x_coords, indexing="ij")  # (H, W)
 
-        # Map (X,Z) into rectangular input normalized coords for grid_sample:
-        # input x_norm in [-1,1], input z_norm in [-1,1]
-        # We assume input image represents x in [-1,1] and z in [0,1] mapped to [-1,1]
-        x_norm = X / (torch.sin(torch.tensor(fan_angle * 0.5 * torch.pi / 180.0, device=device)) + 1e-6)
-        x_norm = x_norm.clamp(-1.0, 1.0)
+        # Distance from virtual apex (located r0 above the probe face, i.e. z = -r0)
+        R_apex = torch.sqrt(X**2 + (Z + r0)**2)
+        Theta  = torch.atan2(X,    Z + r0)
 
-        # Z is [0..1] when Theta around 0; convert to [-1..1]
-        z_norm = 2.0 * Z - 1.0
-        z_norm = z_norm.clamp(-1.0, 1.0)
+        # Fan mask: probe-face arc (r0) → max-depth arc (r0+1), within ±half_fan_rad
+        in_fan = (R_apex >= r0) & (R_apex <= r0 + 1.0) & (Theta.abs() <= half_fan_rad)
 
-        grid = torch.stack([x_norm, z_norm], dim=-1)  # (H,W,2)
-        grid = grid.unsqueeze(0).repeat(N, 1, 1, 1)   # (N,H,W,2)
+        # Sample from flat input at the same Cartesian (x, z) position
+        x_norm = (X / (x_max + 1e-6)).clamp(-1.0, 1.0)   # lateral → [-1, 1]
+        z_norm = (2.0 * Z - 1.0).clamp(-1.0, 1.0)         # depth   → [-1, 1]
 
-        # Create a sector mask (optional) to zero outside desired depth
-        # max_depth is normalized [0..1]
-        if max_depth < 1.0:
-            depth_mask = (R <= max_depth).float()
-        else:
-            depth_mask = None
+        grid = torch.stack([x_norm, z_norm], dim=-1).unsqueeze(0).expand(N, -1, -1, -1)
 
-        # dtype-safe grid_sample
         in_dtype = img.dtype
-        img_f = img.float().unsqueeze(1)  # (N,1,H,W)
-
         out = F.grid_sample(
-            img_f,
+            img.float().unsqueeze(1),
             grid,
             mode="nearest",
             padding_mode="zeros",
             align_corners=True,
-        ).squeeze(1)  # (N,H,W)
+        ).squeeze(1)  # (N, H, W)
 
-        if depth_mask is not None:
-            out = out * depth_mask.unsqueeze(0)
+        out = out * in_fan.float().unsqueeze(0)
 
-        # If original was integer labels, cast back (nearest already)
         if in_dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
             out = out.round().to(in_dtype)
 
@@ -394,8 +383,8 @@ class USSimulatorConv:
         if if_noise:
             US = US + self.generate_noise_map(label_img=label_img)
 
-        # If you want convex output also in this path, uncomment:
-        # US = self.apply_convex_geometry(US)
+        # Apply convex (fan) geometry warp
+        US = self.apply_convex_geometry(US)
 
         return US
 

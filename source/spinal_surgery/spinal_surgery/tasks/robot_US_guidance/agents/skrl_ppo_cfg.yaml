@@ -1,21 +1,21 @@
-seed: 42
+seed: 42 # make training reproducible
 
 
 # Models are instantiated using skrl's model instantiator utility
 # https://skrl.readthedocs.io/en/latest/api/utils/model_instantiators.html
 models:
-  separate: False
+  separate: False # actor and critic share the same CNN backbone if False
   policy:  # see gaussian_model parameters
-    class: GaussianMixin # CategoricalMixin # 
-    clip_actions: False
-    clip_log_std: True
+    class: GaussianMixin # CategoricalMixin #probability distribution  over 4 actions, not a fixed action to allow exploration through randomness ( go 2mm-- with std 0.5> agent goes somewhere between 1.8 and 2.3)
+    clip_actions: False # enforce limit for actions to avoid out of range exploration (e.g., due to high std)
+    clip_log_std: True # to enforce log limits
     min_log_std: -20.0
     max_log_std: 2.0
-    initial_log_std: 0.0
+    initial_log_std: 0.0 #early training high exploration, later training low exploration because agent becomes confident
     network:
-      - name: features_extractor
-        input: STATES  # PyTorch NHWC -> NCHW
-        layers:
+      - name: features_extractor # shared CNN backbone to extract features from input states (e.g., images)
+        input: STATES  # PyTorch NHWC -> NCHW 
+        layers: #extract visual features 
           - conv2d: {out_channels: 32, kernel_size: 8, stride: 2, padding: 0}
           - conv2d: {out_channels: 64, kernel_size: 4, stride: 2, padding: 0}
           - conv2d: {out_channels: 64, kernel_size: 4, stride: 2, padding: 0}
@@ -27,8 +27,8 @@ models:
         layers: [512, 256, 128]
         activations: elu
     output: ACTIONS
-  value:  # see deterministic_model parameters
-    class: DeterministicMixin
+  value:  # see deterministic_model parameters #critic is deterministic because it only estimates the value of a state, no need for exploration
+    class: DeterministicMixin # outputs a fixed value for each state
     clip_actions: False
     network:
       - name: features_extractor
@@ -44,7 +44,7 @@ models:
         input: features_extractor
         layers: [512, 256, 128]
         activations: elu
-    output: ONE
+    output: ONE # one value for each state
 
 
 # Rollout memory
@@ -58,8 +58,7 @@ memory:
 # https://skrl.readthedocs.io/en/latest/api/agents/ppo.html
 agent:
   class: PPO
-  rollouts: 32
-  learning_epochs: 5
+  rollouts: 32 # Collect 32 steps per environment before doing any update. With 64 envs → 32×64 = 2048 experience samples per update.
   mini_batches: 32
   discount_factor: 0.99
   lambda: 0.95
@@ -87,7 +86,8 @@ agent:
     directory: "US_guidance"
     experiment_name: "PPO_US"
     write_interval: 1000 #auto
-    checkpoint_interval: 5000 #auto
+    checkpoint_interval: 5000 # Model weights saved every 5000 timesteps → you can resume from any checkpoint
+
 
 
 # Sequential trainer

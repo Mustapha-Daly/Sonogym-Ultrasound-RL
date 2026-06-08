@@ -43,6 +43,7 @@ kernel_size: [11, 11]
 E_S_ratio: 20 # 20
 probe:   #i added this part
   type: convex       # <<< KEY
-  radius: 40           # mm, only for  convex probe
+  radius: 100          # mm, only for  convex probe
   fan_angle: 60    # degrees (50–90 common)
-  depth: 0.18 # meters (matches image height)
+  depth: 0.18          # meters (matches image height)
+  near_field: 0.020    # metres — top arc dead zone; 0.015=small, 0.030=large (hides surface noise)
