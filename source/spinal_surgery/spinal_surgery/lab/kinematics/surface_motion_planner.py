@@ -138,9 +138,14 @@ class SurfaceMotionPlanner(HumanFrameViewer):
             cur_x = self.current_x_z_x_angle_cmd[i::self.n_human_types, 0]
             cur_z = self.current_x_z_x_angle_cmd[i::self.n_human_types, 1]
 
-            self.target_z_axis[i::self.n_human_types, :] = self.surface_normal_list[i][cur_x.int(), cur_z.int()]
+            max_x = self.surface_normal_list[i].shape[0] - 1
+            max_z = self.surface_normal_list[i].shape[1] - 1
+            cur_x_idx = cur_x.int().clamp(0, max_x)
+            cur_z_idx = cur_z.int().clamp(0, max_z)
 
-            target_y = self.surface_map_list[i][cur_x.int(), cur_z.int()]
+            self.target_z_axis[i::self.n_human_types, :] = self.surface_normal_list[i][cur_x_idx, cur_z_idx]
+
+            target_y = self.surface_map_list[i][cur_x_idx, cur_z_idx]
             self.target_position[i::self.n_human_types, 0] = cur_x
             self.target_position[i::self.n_human_types, 1] = target_y
             self.target_position[i::self.n_human_types, 2] = cur_z

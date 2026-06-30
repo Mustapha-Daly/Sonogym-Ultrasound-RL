@@ -209,7 +209,7 @@ class roboticUSEnvCfg(DirectRLEnvCfg):
     episode_length_s = scene_cfg["sim"]["episode_length"]  # 300
     action_scale = 1
     action_space = 4
-    observation_space = [3, 240, 200] #[1, 150, 200]
+    observation_space = {"image": [3, 200, 150], "pose": [12]} # 3 frame image stack + 12 value pose history
     state_space = 0
     observation_scale = scene_cfg["observation"]["scale"]
     #VERTEBRA_LABEL_ID = 7
@@ -383,7 +383,9 @@ class roboticUSEnv(DirectRLEnv):
             visualize=self.sim_cfg["vis_seg_map"],
             sim_mode=scene_cfg["sim"]["us"],
             us_generative_cfg=us_generative_cfg,
+            allocate_us_random_maps=scene_cfg["observation"]["mode"] == "US",
         )
+        self._inject_target_volume()
         self.coronal_x_angle_rad = float(
             scene_cfg["motion_planning"].get("coronal_x_angle_rad", 0.5 * np.pi)
         )
@@ -433,30 +435,16 @@ class roboticUSEnv(DirectRLEnv):
                 self.sim.device,
             )
 
-        # change observation space to image
-        self.observation_space = gym.spaces.Box(
-            low=0,
-            high=255,
-            shape=(
-                self.cfg.observation_space[0],
-                self.cfg.observation_space[1],
-                self.cfg.observation_space[2],
-            ),
-            dtype=np.uint8,
-        )
-
-        self.cfg.observation_space[0] = self.US_slicer.img_thickness
-
-        self.single_observation_space["policy"] = gym.spaces.Box(
-            low=0,
-            high=255,
-            shape=(
-                self.cfg.observation_space[0],
-                self.cfg.observation_space[1],
-                self.cfg.observation_space[2],
-            ),
-            dtype=np.float32,
-        )
+        # Added: observation space: image history + pose history as separate branches
+        _W, _H = us_cfg["image_size"]
+        self.observation_space = gym.spaces.Dict({
+            "image": gym.spaces.Box(low=0, high=255, shape=(3, _W, _H), dtype=np.float32),
+            "pose":  gym.spaces.Box(low=0.0, high=1.0, shape=(12,),     dtype=np.float32),
+        })
+        self.single_observation_space["policy"] = gym.spaces.Dict({
+            "image": gym.spaces.Box(low=0, high=255, shape=(3, _W, _H), dtype=np.float32),
+            "pose":  gym.spaces.Box(low=0.0, high=1.0, shape=(12,),     dtype=np.float32),
+        })
 
         self.termination_direct = True
         self.observation_mode = scene_cfg["observation"]["mode"]
@@ -468,6 +456,10 @@ class roboticUSEnv(DirectRLEnv):
         )
 
         self.w_pos = scene_cfg["reward"]["w_pos"]
+        self.w_liver = scene_cfg["reward"]["w_liver"]
+        self.w_bone  = scene_cfg["reward"]["w_bone"]
+        self.w_progress = scene_cfg["reward"]["w_progress"]
+
 
         self.single_action_space = gym.spaces.Box(
             low=-(self.max_action[0, :] / self.action_scale[0, :]).cpu().numpy(),
@@ -476,8 +468,34 @@ class roboticUSEnv(DirectRLEnv):
             dtype=np.float32,
         )
 
-        wandb.init()
         self.num_step = 0
+
+        # Added:  Frame Buffer: holds last 3 Slices for every env
+        self.N_frames = 3
+        _W, _H = us_cfg["image_size"]   # [W, H] from yaml
+        self.frame_buffer = torch.zeros(
+            self.scene.num_envs, self.N_frames, _W, _H,
+            device=self.sim.device
+        )
+        # Added: pose buffer: last N poses, each = [x, z, angle, roll]
+        self.pose_buffer = torch.zeros(
+            self.scene.num_envs, self.N_frames, 4,
+            device=self.sim.device
+        )
+
+        # normalization ranges [0, 1]
+        xz_range = self.sim_cfg["patient_xz_range"]
+        self.pose_norm_min = torch.tensor(
+            [xz_range[0][0], xz_range[0][1], -3.14, -self.max_roll_adj],
+            device=self.sim.device
+        )
+        self.pose_norm_max = torch.tensor(
+            [xz_range[1][0], xz_range[1][1],  3.14,  self.max_roll_adj],
+            device=self.sim.device
+        )
+
+        self._img_W, self._img_H = us_cfg["image_size"]
+
 
     def get_US_target_pose(self):
 
@@ -616,21 +634,23 @@ class roboticUSEnv(DirectRLEnv):
         clarity = gx.abs().mean(dim=(1, 2, 3)) + gy.abs().mean(dim=(1, 2, 3))
         return clarity
         cfg: roboticUSEnvCfg
-        # ADD THE FUNCTION HERE
+
     def _orient_convex_hw(self, img_wh: torch.Tensor) -> torch.Tensor:
-        """
-        Convert slicer output (B,W,H) to ultrasound-style orientation (B,H,W)
-        """
         if img_wh.dim() == 3:
             img_hw = img_wh.permute(0, 2, 1).contiguous()
         else:
             img_hw = img_wh.permute(0, 2, 1, 3).contiguous()
 
-        # flip vertically so depth increases downward
-       # img_hw = torch.flip(img_hw, dims=[1])
+        img_hw = torch.flip(img_hw, dims=[2])   # horizontal flip
 
         return img_hw
     
+    #Added: Pose Normalization helper
+    def _normalize_pose(self, pose: torch.Tensor) -> torch.Tensor:
+        return (pose - self.pose_norm_min) / (
+            self.pose_norm_max - self.pose_norm_min + 1e-6
+        )
+
     def _apply_superficial_bone_shadow(self, label_hw: torch.Tensor) -> torch.Tensor:
         B, H, W = label_hw.shape
         shadowed = label_hw.clone()
@@ -655,8 +675,70 @@ class roboticUSEnv(DirectRLEnv):
         shadowed[shadow] = 0
         return shadowed
 
-    
-  
+    def _inject_target_volume(self):
+        """One-time injection of a small spherical target sub-volume into the patient's
+        label map, only overwriting liver voxels. Used for the 3D coverage-based reward
+        (supervisor's updated task: scan/reconstruct a specific volume inside the liver,
+        analogous to a tumor in Bi et al. 2026)."""
+        target_cfg = scene_cfg.get("target_volume", {})
+        if not target_cfg.get("enabled", False):
+            return
+
+        cx, cy, cz = [int(v) for v in target_cfg["center_voxel"]]
+        radius_mm = float(target_cfg["radius_mm"])
+        radius_voxels = radius_mm / (self.US_slicer.label_res * 1000.0)
+        target_label_id = int(target_cfg["label_id"])
+        r_int = int(radius_voxels) + 1
+
+        # per-human-type bookkeeping needed for 3D coverage tracking (step 2)
+        self.target_bbox_list = []
+        self.target_mask_local_list = []
+        self.target_total_voxels_list = []
+
+        for i in range(self.US_slicer.n_human_types):
+            label_map = self.US_slicer.label_maps[i]
+            X, Y, Z = label_map.shape
+
+            x_min, x_max = max(cx - r_int, 0), min(cx + r_int + 1, X)
+            y_min, y_max = max(cy - r_int, 0), min(cy + r_int + 1, Y)
+            z_min, z_max = max(cz - r_int, 0), min(cz + r_int + 1, Z)
+
+            xs = torch.arange(x_min, x_max, device=label_map.device).view(-1, 1, 1)
+            ys = torch.arange(y_min, y_max, device=label_map.device).view(1, -1, 1)
+            zs = torch.arange(z_min, z_max, device=label_map.device).view(1, 1, -1)
+            dist2 = (xs - cx) ** 2 + (ys - cy) ** 2 + (zs - cz) ** 2
+            sphere_mask = dist2 <= radius_voxels ** 2
+
+            local_block = label_map[x_min:x_max, y_min:y_max, z_min:z_max]
+            liver_mask = local_block == self.cfg.LIVER_LABEL_ID
+            write_mask = sphere_mask & liver_mask
+            local_block[write_mask] = target_label_id
+            label_map[x_min:x_max, y_min:y_max, z_min:z_max] = local_block
+
+            n_voxels = int(write_mask.sum().item())
+            print(f"[TARGET VOLUME] human_type={i}: injected {n_voxels} voxels of label "
+                  f"{target_label_id} around center ({cx},{cy},{cz}), "
+                  f"radius {radius_voxels:.1f} voxels ({radius_mm}mm)")
+
+            # store for 3D coverage tracking: where the target sits (bbox) and which
+            # voxels inside that bbox actually belong to the target (write_mask)
+            self.target_bbox_list.append((x_min, x_max, y_min, y_max, z_min, z_max))
+            self.target_mask_local_list.append(write_mask.clone())
+            self.target_total_voxels_list.append(n_voxels)
+
+        self._init_coverage_buffers()
+
+    def _init_coverage_buffers(self):
+        """Per-env boolean buffer tracking which target voxels have been scanned so far
+        in the current episode. Reset every episode in _reset_idx."""
+        num_envs = self.scene.num_envs
+        self.scanned_target_mask = []
+        for i in range(self.US_slicer.n_human_types):
+            dx, dy, dz = self.target_mask_local_list[i].shape
+            self.scanned_target_mask.append(
+                torch.zeros((num_envs, dx, dy, dz), dtype=torch.bool, device=self.sim.device)
+            )
+
     def _get_observations(self) -> dict:
         # -------------------------------------------------
         # Pose extraction
@@ -711,13 +793,46 @@ class roboticUSEnv(DirectRLEnv):
                 self.US_ee_pose_w[:, 0:3],
                 self.US_ee_pose_w[:, 3:7],
             )
+            
+            #Added: Create task image 
+            label_wh = self.US_slicer.label_img_tensor[:, :, :, 0].to(torch.long)   # (B, W, H)
+            label_hw = self._orient_convex_hw(label_wh)                              # (B, H, W)
+            label_task_hw = self._apply_superficial_bone_shadow(label_hw)            # (B, H, W)
+            self._label_for_task = label_task_hw
 
-            label_img = (
-                self.US_slicer.label_img_tensor.permute(0, 3, 1, 2)
+            # shadow mask 
+            self._shadow_mask_for_task = (label_hw != 0) & (label_task_hw == 0)
+
+            # keep  existing frame-buffer layout (B, 1, W, H)
+            current_frame = (
+                label_task_hw.permute(0, 2, 1).unsqueeze(1).float()
                 * self.cfg.observation_scale
             )
-            observations = {"policy": label_img}
 
+            # Added: frame buffer: push current frame in, drop oldest
+            self.frame_buffer = torch.cat([
+                self.frame_buffer[:, 1:, :, :],
+                current_frame,
+            ], dim=1)  # (B, 3, W, H)
+
+            #  pose buffer: push current pose in, drop oldest 
+            current_pose = torch.cat([
+                self.US_slicer.current_x_z_x_angle_cmd[:, :3],
+                self.US_slicer.roll_adj[:, :1],
+            ], dim=-1)  # (B, 4)
+            current_pose_norm = self._normalize_pose(current_pose)
+            self.pose_buffer = torch.cat([
+                self.pose_buffer[:, 1:, :],
+                current_pose_norm.unsqueeze(1),
+            ], dim=1)  # (B, 3, 4)
+
+            B = self.scene.num_envs
+            observations = {
+                "policy": {
+                    "image": self.frame_buffer.clone(),
+                    "pose":  self.pose_buffer.reshape(B, -1).clone(), #(B, 3, 4) → (B, 12) flat vector for MLP
+                }
+            }
         # -------------------------------------------------
         # Semantic navigation logic
         # -------------------------------------------------
@@ -742,7 +857,8 @@ class roboticUSEnv(DirectRLEnv):
         # -------------------------------------------------
         # Debug (optional)
         # -------------------------------------------------
-        if self.num_step % 30 == 0:
+        if self.sim.has_gui() and self.num_step % 30 == 0:
+
             import matplotlib.pyplot as plt
 
             if self.observation_mode == "US":
@@ -768,6 +884,23 @@ class roboticUSEnv(DirectRLEnv):
                 label_hw = self._orient_convex_hw(label_wh)
                 label_hw = self._apply_superficial_bone_shadow(label_hw)
 
+                if hasattr(self.US_slicer, "last_sampled_coords"):
+                    # last_sampled_coords is (B, W, H, E, 3) — raw orientation, before _orient_convex_hw's
+                    # permute+flip. Apply the SAME transform so indices line up with the displayed image.
+                    coords_oriented = self.US_slicer.last_sampled_coords.permute(0, 2, 1, 3, 4)  # (B,H,W,E,3)
+                    coords_oriented = torch.flip(coords_oriented, dims=[2])  # match horizontal flip
+                    H_img, W_img = label_hw.shape[-2], label_hw.shape[-1]
+
+                    # TARGET_PICK_FRAC: (row_frac, col_frac) as fraction of image height/width, 0.0-1.0
+                    # (0.5, 0.5) = dead center. Edit these to probe a specific pixel instead of the center.
+                    TARGET_PICK_FRAC = (0.5, 0.5)
+                    h_idx = int(TARGET_PICK_FRAC[0] * (H_img - 1))
+                    w_idx = int(TARGET_PICK_FRAC[1] * (W_img - 1))
+
+                    voxel_at_pick = coords_oriented[0, h_idx, w_idx, 0]
+                    print(f"[TARGET PICK] voxel coords at frac={TARGET_PICK_FRAC} "
+                          f"(pixel h={h_idx},w={w_idx} of {H_img}x{W_img}): {voxel_at_pick.tolist()}")
+
                 # pick env 0 for plotting
                 label2d = label_hw[0]  # (H,W)
                 if self.num_step == 5:
@@ -791,17 +924,19 @@ class roboticUSEnv(DirectRLEnv):
 
                 palette[0]  = torch.tensor([0,0,0], device=label2d.device)        # background
                 palette[1]  = torch.tensor([255,255,0], device=label2d.device)    # spleen
-                palette[2] = torch.tensor([160, 160, 255], device=label2d.device)  # Right Kidney
+                palette[63] = torch.tensor([160, 160, 255], device=label2d.device)  # IVC
                 palette[8]  = torch.tensor([0,255,255], device=label2d.device)    # muscle
                 palette[10] = torch.tensor([255, 165, 0], device=label2d.device)  # organ tissue
                 palette[12] = torch.tensor([144,238,144], device=label2d.device)      # skin / fat
                 palette[13] = torch.tensor([255,0,0], device=label2d.device)      # bone
                 palette[5] = torch.tensor([0,0,200], device=label2d.device)  # main organ class
                 palette[64] = torch.tensor([0, 100, 255], device=label2d.device)  # Portal Vein
-                palette[51] = torch.tensor([148,0,211], device=label2d.device)      # IVC
+                palette[6] = torch.tensor([148,0,211], device=label2d.device)      # Stomach
                 palette[7] = torch.tensor([139, 69, 19], device=label2d.device)  # pancreas
                 palette[4] = torch.tensor([255, 255, 255], device=label2d.device)  # gallbladder
                 palette[15] = torch.tensor([255, 105, 180], device=label2d.device)  # costal cartilages
+                palette[52] = torch.tensor([245, 222, 179], device=label2d.device)  # aorta
+                palette[200] = torch.tensor([0, 255, 0], device=label2d.device)  # target volume
 
 
                 rgb = palette[label2d].detach().cpu().numpy()  # (H,W,3)
@@ -823,17 +958,20 @@ class roboticUSEnv(DirectRLEnv):
                 legend_items = [
                     mpatches.Patch(color=(0, 0, 0), label="Background (ID 0)"),
                     mpatches.Patch(color=(1,1,0), label="Spleen (ID 1)"), 
-                    mpatches.Patch(color=(160/255, 160/255, 1), label="Right Kidney (ID 2)"),
+                    mpatches.Patch(color=(160/255, 160/255, 1), label="IVC (ID 63)"),
                     mpatches.Patch(color=(0,1,1), label="Muscle (ID 8)"),
                     mpatches.Patch(color=(1, 165/255, 0), label="Organ tissue (ID 10)"),
                     mpatches.Patch(color=(0.56,0.93,0.56), label="Skin / Fat (ID 12)"),
                     mpatches.Patch(color=(1,0,0), label="Bone / Vertebra (ID 13)"),
                     mpatches.Patch(color=(0,0,0.6), label="Liver (ID 5)"),
                     mpatches.Patch(color=(0, 100/255, 1), label="Portal Vein (ID 64)"),
-                    mpatches.Patch(color=(148/255, 0, 211/255), label="HEART (ID 51)"),
+                    mpatches.Patch(color=(148/255, 0, 211/255), label="Stomach (ID 6)"),
                     mpatches.Patch(color=(139/255, 69/255, 19/255), label="Pancreas (ID 7)"), 
                     mpatches.Patch(color=(1, 1, 1), label="Gallbladder (ID 4)"), 
                     mpatches.Patch(color=(1, 105/255, 180/255), label="Costal Cartilages (ID 15)"),
+                    mpatches.Patch(color=(245/255, 222/255, 179/255), label="Aorta (ID 52)"),
+                    mpatches.Patch(color=(0, 1, 0), label="Target Volume (ID 200)"),
+
                 ]
                 plt.legend(handles=legend_items,loc="center left",bbox_to_anchor=(1.02, 0.5),frameon=True)
                 plt.pause(0.001)
@@ -862,7 +1000,6 @@ class roboticUSEnv(DirectRLEnv):
             vec_robot_to_patient = patient_pos - robot_pos
             x_cmd = self.US_slicer.current_x_z_x_angle_cmd[0, 0].int()
             z_cmd = self.US_slicer.current_x_z_x_angle_cmd[0, 1].int()
-            print(f"probe x={x_cmd.item()}  z={z_cmd.item()}")   # ← add here
             normal_human = self.US_slicer.surface_normal_list[0][x_cmd, z_cmd]
 
 
@@ -913,6 +1050,16 @@ class roboticUSEnv(DirectRLEnv):
             min=-self.max_roll_adj,
             max=self.max_roll_adj,
         )
+        if self.num_step % 10 == 0:
+
+            print(
+                f"[step {self.num_step}] "
+                f"current_x={self.US_slicer.current_x_z_x_angle_cmd[0, 0].item():.2f}, "
+                f"current_z={self.US_slicer.current_x_z_x_angle_cmd[0, 1].item():.2f}, "
+                f"current_angle={self.US_slicer.current_x_z_x_angle_cmd[0, 2].item():.4f}, "
+                f"current_roll={self.US_slicer.roll_adj[0, 0].item():.4f}"
+            ) # Current command in human frame (x,z,angle,roll)
+        
 
         # compute desired world to ee pose
         world_to_ee_target_pos, world_to_ee_target_rot = (
@@ -958,47 +1105,70 @@ class roboticUSEnv(DirectRLEnv):
         joint_pos_des = self.pose_diff_ik_controller.compute(
             self.US_ee_pos_b, self.US_ee_quat_b, US_jacobian, US_joint_pos
         )
-        # apply joint oosition target
+        # apply joint position target
         self.robot.set_joint_position_target(
             joint_pos_des, joint_ids=self.robot_entity_cfg.joint_ids
         )
 
-    def _get_rewards(self) -> torch.Tensor: #new: reward based on liver visibility and progress
-        if self.observation_mode == "seg" and hasattr(self, "_label_for_task"):
-            label = self._label_for_task      # convex label
-        else:
-            label = self.US_slicer.label_img_tensor[:, :, :, 0]
-        
-        liver_mask = (label == self.cfg.LIVER_LABEL_ID)
-        B, H, W = liver_mask.shape
-        liver_pixels = liver_mask.sum(dim=(1, 2))
-        liver_fraction = liver_pixels / (H * W)
-        if not hasattr(self, "prev_liver_fraction"):
-            self.prev_liver_fraction = liver_fraction.clone()
-        progress = liver_fraction - self.prev_liver_fraction
-        progress = torch.clamp(progress, min=-0.05, max=0.05)
 
-        reward = (2.0 * liver_fraction + 4.0 * progress)
-
-        self.prev_liver_fraction = liver_fraction.clone()
-        
-        return reward
-
-    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]: # episode ends when liver is sufficiently visible or timeout
+    def _get_rewards(self) -> torch.Tensor:
         if self.observation_mode == "seg" and hasattr(self, "_label_for_task"):
             label = self._label_for_task
         else:
             label = self.US_slicer.label_img_tensor[:, :, :, 0]
 
+        B, H, W = label.shape
+        total_pixels = H * W
+
+        # Term 1: liver coverage
+        liver_mask = (label == self.cfg.LIVER_LABEL_ID)
+        liver_fraction = liver_mask.sum(dim=(1, 2)).float() / total_pixels
+
+        # Term 2: visible bone / cartilage
+        bone_mask = (label == 13) | (label == 15)
+        bone_fraction = bone_mask.sum(dim=(1, 2)).float() / total_pixels
+
+        # Term 3: black shadow caused by superficial bone
+        if hasattr(self, "_shadow_mask_for_task"):
+            shadow_fraction = self._shadow_mask_for_task.sum(dim=(1, 2)).float() / total_pixels
+        else:
+            shadow_fraction = torch.zeros_like(liver_fraction)
+
+        # Term 4: progress
+        if not hasattr(self, "prev_liver_fraction"):
+            self.prev_liver_fraction = torch.zeros_like(liver_fraction)
+
+        progress = liver_fraction - self.prev_liver_fraction
+        progress = torch.clamp(progress, min=-0.05, max=0.05)
+
+        reward = (
+            self.w_liver * liver_fraction
+            + self.w_progress * progress
+            - self.w_bone * (bone_fraction + 0.5 * shadow_fraction)
+        )
+
+        if wandb.run is not None and self.num_step % 50 == 0:
+            wandb.log({
+                "liver_fraction": liver_fraction.mean().item(),
+                "bone_fraction": bone_fraction.mean().item(),
+                "shadow_fraction": shadow_fraction.mean().item(),
+                "progress": progress.mean().item(),
+                "reward_mean": reward.mean().item(),
+            })
+
+        self.prev_liver_fraction = liver_fraction.clone()
+        return reward
+
+    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]: # episode ends when liver is sufficiently visible or timeout
+        if self.observation_mode == "seg" and hasattr(self, "_label_for_task"):
+            label = self._label_for_task
+
         liver_mask = (label == self.cfg.LIVER_LABEL_ID)
         liver_pixels = liver_mask.sum(dim=(1, 2))
         H, W = label.shape[1], label.shape[2]
         liver_fraction = liver_pixels / (H * W)
-        if self.num_step % 50 == 0:
-            wandb.log({
-                "liver_fraction": liver_fraction.mean().item()
-            })
-        terminated = (liver_fraction > 0.99)
+        terminated = (liver_fraction > 0.85)
+        #terminated = (liver_fraction > 0.80) | self.US_slicer.no_collide 
 
         time_outs = self.episode_length_buf >= self.max_episode_length - 1
 
@@ -1090,6 +1260,13 @@ class roboticUSEnv(DirectRLEnv):
             env_ids = self.robot._ALL_INDICES
         super()._reset_idx(env_ids)
 
+        self.frame_buffer[env_ids] = 0.0
+        self.pose_buffer[env_ids] = 0.0
+
+        if hasattr(self, "scanned_target_mask"):
+            for i in range(len(self.scanned_target_mask)):
+                self.scanned_target_mask[i][env_ids] = False
+
         joint_pos = self.robot.data.default_joint_pos.clone()
         joint_vel = self.robot.data.default_joint_vel.clone()
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel)
@@ -1143,6 +1320,9 @@ class roboticUSEnv(DirectRLEnv):
         self.US_slicer.update_cmd(
             cmd_target_poses - self.US_slicer.current_x_z_x_angle_cmd
         )
+        roll_init = float(scene_cfg["motion_planning"].get("roll_init", 0.0))
+        self.US_slicer.roll_adj[env_ids] = roll_init
+
         self.US_slicer.current_x_z_x_angle_cmd = self._lock_cmd_to_plane_angle(
             self.US_slicer.current_x_z_x_angle_cmd
         )
@@ -1157,118 +1337,6 @@ class roboticUSEnv(DirectRLEnv):
             self.US_slicer.human_to_ee_target_pos,
             self.US_slicer.human_to_ee_target_quat,
         )
-
-        if hasattr(self, "total_reward"):
-            wandb.log({"total_reward": self.total_reward.mean().item()})
-            wandb.log({"distance_to_goal": self.distance_to_goal.mean().item()})
-            wandb.log(
-                {
-                    "pos err": (
-                        torch.norm(
-                            self.cur_cmd_pose[:, 0:2] - self.goal_cmd_pose[:, 0:2],
-                            dim=-1,
-                        )
-                        * self.US_slicer.label_res
-                    )
-                    .mean()
-                    .item()
-                }
-            )
-            wandb.log(
-                {
-                    "pos err std": (
-                        torch.norm(
-                            self.cur_cmd_pose[:, 0:2] - self.goal_cmd_pose[:, 0:2],
-                            dim=-1,
-                        )
-                        * self.US_slicer.label_res
-                    )
-                    .std()
-                    .item()
-                }
-            )
-            wandb.log(
-                {
-                    "pos err max": (
-                        torch.norm(
-                            self.cur_cmd_pose[:, 0:2] - self.goal_cmd_pose[:, 0:2],
-                            dim=-1,
-                        )
-                        * self.US_slicer.label_res
-                    )
-                    .max()
-                    .item()
-                }
-            )
-            wandb.log(
-                {
-                    "pos err min": (
-                        torch.norm(
-                            self.cur_cmd_pose[:, 0:2] - self.goal_cmd_pose[:, 0:2],
-                            dim=-1,
-                        )
-                        * self.US_slicer.label_res
-                    )
-                    .min()
-                    .item()
-                }
-            )
-            wandb.log(
-                {
-                    "rot err": (
-                        torch.norm(
-                            self.cur_cmd_pose[:, 2:3] - self.goal_cmd_pose[:, 2:3],
-                            dim=-1,
-                        )
-                        * 180
-                        / torch.pi
-                    )
-                    .mean()
-                    .item()
-                }
-            )
-            wandb.log(
-                {
-                    "rot err std": (
-                        torch.norm(
-                            self.cur_cmd_pose[:, 2:3] - self.goal_cmd_pose[:, 2:3],
-                            dim=-1,
-                        )
-                        * 180
-                        / torch.pi
-                    )
-                    .std()
-                    .item()
-                }
-            )
-            wandb.log(
-                {
-                    "rot err max": (
-                        torch.norm(
-                            self.cur_cmd_pose[:, 2:3] - self.goal_cmd_pose[:, 2:3],
-                            dim=-1,
-                        )
-                        * 180
-                        / torch.pi
-                    )
-                    .max()
-                    .item()
-                }
-            )
-            wandb.log(
-                {
-                    "rot err min": (
-                        torch.norm(
-                            self.cur_cmd_pose[:, 2:3] - self.goal_cmd_pose[:, 2:3],
-                            dim=-1,
-                        )
-                        * 180
-                        / torch.pi
-                    )
-                    .min()
-                    .item()
-                }
-            )
 
         # init distance to goal
         if self.use_vertebra_goal:
@@ -1310,4 +1378,3 @@ class roboticUSEnv(DirectRLEnv):
                 torch.save(self.cmd_pose_trajs, record_path + "cmd_pose_trajs.pt")
                 torch.save(self.goal_cmd_pose, record_path + "goal_cmd_pose.pt")
             self.cmd_pose_trajs = [self.cur_cmd_pose]
-        # -------------------------------------------------

@@ -11,7 +11,7 @@ models:
     clip_log_std: True # to enforce log limits
     min_log_std: -20.0
     max_log_std: 2.0
-    initial_log_std: 0.0 #early training high exploration, later training low exploration because agent becomes confident
+    initial_log_std: 0.0 # kept at default for now; SharedModel in train.py currently sets log-std in code
     network:
       - name: features_extractor # shared CNN backbone to extract features from input states (e.g., images)
         input: STATES  # PyTorch NHWC -> NCHW 
@@ -58,14 +58,14 @@ memory:
 # https://skrl.readthedocs.io/en/latest/api/agents/ppo.html
 agent:
   class: PPO
-  rollouts: 32 # Collect 32 steps per environment before doing any update. With 64 envs → 32×64 = 2048 experience samples per update.
-  mini_batches: 32
+  rollouts: 64 # 64×4 envs = 256 samples/update
+  mini_batches: 4 # 256/4 = 64 samples/minibatch
   discount_factor: 0.99
   lambda: 0.95
-  learning_rate: 1.0e-04
+  learning_rate: 2.0e-04
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.008
+    kl_threshold: 0.016
   state_preprocessor: null
   state_preprocessor_kwargs: null
   value_preprocessor: RunningStandardScaler
@@ -85,8 +85,8 @@ agent:
   experiment:
     directory: "US_guidance"
     experiment_name: "PPO_US"
-    write_interval: 1000 #auto
-    checkpoint_interval: 5000 # Model weights saved every 5000 timesteps → you can resume from any checkpoint
+    write_interval: 200
+    checkpoint_interval: 5000
 
 
 
@@ -94,11 +94,10 @@ agent:
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 500000
+  timesteps: 300000
   environment_info: log
 probe:   #i added this part
   type: convex          # <<< KEY
   #radius: 60             # mm, typical convex probe
   fan_angle: 60          # degrees (50–90 common)
   depth: 0.16            # mm (matches image height)
-

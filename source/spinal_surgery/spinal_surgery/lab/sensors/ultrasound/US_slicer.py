@@ -34,12 +34,13 @@ class USSlicer(LabelImgSlicer):
         label_res=0.0015,
         max_distance=0.03,  # [m]
         body_label=120,
-        height=0.12,
+        height=0.1,
         height_img=0.120,  # 0.133
         visualize=True,
         plane_axes={"h": [0, 0, 1], "w": [1, 0, 0]},
         sim_mode="conv",
         us_generative_cfg=None,
+        allocate_us_random_maps=True,
     ):
         """
         label maps: list of label maps (3D volumes)
@@ -102,6 +103,8 @@ class USSlicer(LabelImgSlicer):
 
         self.us_cfg = us_cfg
         self.if_use_ct = if_use_ct
+        self.allocate_us_random_maps = bool(allocate_us_random_maps)
+        self._rand_maps_ready = False
         probe_cfg = us_cfg.get("probe", {})
         self.probe_type = probe_cfg.get("type", "convex")
         self.fan_angle_deg = float(probe_cfg.get("fan_angle", 60.0))
@@ -113,9 +116,10 @@ class USSlicer(LabelImgSlicer):
             for key, value in label_convert_map.items():
                 self.label_maps[i][self.label_maps[i] == key] = value
 
-        # construct random maps
-        self.construct_T_maps()
-        self.construct_Vl_maps()
+        # Build the heavy random maps only when the current observation mode
+        # actually needs simulated US intensities.
+        if self.allocate_us_random_maps:
+            self._ensure_rand_maps()
 
         # construct images
         self.T0_img_tensor = torch.zeros(
@@ -142,6 +146,13 @@ class USSlicer(LabelImgSlicer):
             dtype=torch.float32,
             device=self.device,
         )
+
+    def _ensure_rand_maps(self):
+        if self._rand_maps_ready:
+            return
+        self.construct_T_maps()
+        self.construct_Vl_maps()
+        self._rand_maps_ready = True
 
     # -------------------- your code continues unchanged --------------------
 
@@ -322,6 +333,7 @@ class USSlicer(LabelImgSlicer):
         )
 
         if self.sim_mode == "conv" or self.sim_mode == "both":
+            self._ensure_rand_maps()
             self.slice_rand_maps(
                 world_to_human_pos,
                 world_to_human_quat,
@@ -440,4 +452,3 @@ class USSlicer(LabelImgSlicer):
                     cmap="gray",
                 )
                 plt.pause(0.0001)
-

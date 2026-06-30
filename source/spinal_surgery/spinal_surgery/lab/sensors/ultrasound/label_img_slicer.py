@@ -188,7 +188,13 @@ class LabelImgSlicer(SurfaceMotionPlanner):
             inds = slice(i, None, self.n_human_types)
 
             #coords = human_vox[inds].long()
-            coords = torch.round(human_vox[inds]).long()
+            coords_f = torch.round(human_vox[inds])
+            if torch.isnan(coords_f).any():
+                print(f"[WARN] NaN in slicer coords (human_type={i}) — clamping to 0. Check IK/quaternion validity.")
+                coords_f = torch.nan_to_num(coords_f, nan=0.0)
+            coords = coords_f.long()
+            # reshape to (B, W, H, E, 3) so it aligns 1:1 with label_img_tensor's (B, W, H, E) layout
+            self.last_sampled_coords = coords.reshape(-1, W, H, E, 3)
             sampled_label = self.label_maps[i][coords[:, :, 0], coords[:, :, 1], coords[:, :, 2]]
             sampled_ct = self.ct_maps[i][coords[:, :, 0], coords[:, :, 1], coords[:, :, 2]]
 
@@ -208,6 +214,7 @@ class LabelImgSlicer(SurfaceMotionPlanner):
             self.check_collision(self.label_img_tensor, self.ct_img_tensor)
 
     # ---------------------------------------------------------
+    # NEW FUNCTION
     # Fan warp grid — built ONCE, applied every frame as a 2-D post-process
     # Identical philosophy to the original apply_convex_geometry:
     #   step 1: stable flat 3-D sampling (slice_label_img_planar)
@@ -215,9 +222,7 @@ class LabelImgSlicer(SurfaceMotionPlanner):
     # ---------------------------------------------------------
     def _build_fan_warp_for_labels(self):
         """
-        Cartesian fan output + explicit sector mask — the only way to get
-        visible curved arcs and black corners in the display.
-
+        Cartesian fan output + explicit sector mask 
         Output canvas (H rows × W cols) spans:
           rows  h → probe-frame depth  z = h * max_depth / (H-1)
           cols  w → probe-frame lateral x = (w - W//2) * x_step

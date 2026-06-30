@@ -4,7 +4,7 @@
 3: 10
 4: 4 #gallbladder 
 5: 5 #liver
-6: 10 #stomach 
+6: 6 #stomach 
 7: 7  #Pancreas
 8: 12 
 9: 10
@@ -50,9 +50,9 @@
 48: 13
 49: 13
 50: 13
-51: 51
+51: 10
 # LEFT kidney
-52: 10 # aorta
+52: 52 # aorta
 53: 10
 54: 10
 55: 10

@@ -18,7 +18,7 @@ label_to_ac_params_dict:
   12: {'alpha': 1.09, 'z': 1.63e5, 'mu0': 0.43, 'mu1':  0.41, 's0': 0, 'Al': 0.08, 'fl': 30}
   13: {'alpha': 7.8, 'z': 9e6, 'mu0': 0.78, 'mu1':  0.56, 's0': 0.1, 'Al': 0.08, 'fl': 30}
   14: {'alpha': 0.2, 'z': 1.63e5, 'mu0': 0.53, 'mu1':  0.5, 's0': 0, 'Al': 0.08, 'fl': 30} # fake
-  15: {'alpha': 1.5, 'z': 1.8e5, 'mu0': 0.9, 'mu1': 0.65, 's0': 0.24, 'Al': 0.08, 'fl': 30}
+  15: {'alpha': 0.5, 'z': 1.06e5, 'mu0': 0.9, 'mu1':  0.65, 's0': 0.24, 'Al': 0.08, 'fl': 30}
 system_params:
   frequency: 20 # 10 MHz
   I0: 1 # 1
@@ -36,14 +36,21 @@ system_params:
   noise_s0: 0.0
   noise_f: 300
 surface_to_label_map: {'skin': 12, 'muscle': 8, 'bone': 13}
-image_size: [250, 200] # [150, 200] W x H
-image_3D_thickness: 100 #T 100 for model-based, 50 for learning-based
-resolution: 0.0015 #  0.0005 for learning-based 0.0004 for model-based
+image_size: [200, 150]  # W x H  [200, 150] [500, 320] [141, 46] for 22.8 x 70.6 mm
+image_3D_thickness: 50  #T 100 for model-based, 50 for learning-based
+resolution: 0.001 #  0.0005m for learning-based 0.0004m for model-based
 kernel_size: [11, 11]
 E_S_ratio: 20 # 20
-probe:   #i added this part
-  type: convex       # <<< KEY
-  radius: 100          # mm, only for  convex probe
-  fan_angle: 60    # degrees (50–90 common)
-  depth: 0.18          # meters (matches image height)
-  near_field: 0.020    # metres — top arc dead zone; 0.015=small, 0.030=large (hides surface noise)
+
+probe: # Siemens 5C1
+  type: convex      # 'linear' or 'convex'
+  radius: 62          # mm, only for  convex probe, tells how curved the probe face is, bigger radius means less curved
+  fan_angle: 70  # degrees (50–90 common) , how wide the us beam spread out (Philips C6-2 example)
+  depth: 0.16     # meters (matches image height)
+  near_field: 0.015  #  top arc dead zone; 0.015=small, 0.030=large (hides surface noise)
+  
+  #Formulas used: 
+  #chord (footprint W) = 2 × radius × sin(fan_angle/2)
+  #box_H = near_field + radius + depth = 15 + 62 + 160 = 237mm → 237/1mm = 237px
+  #box_W = 2 × (radius + depth) × tan(fan_angle/2) = 2 × 222 × tan(35°) = 311mm → 311/1mm = 311px
+

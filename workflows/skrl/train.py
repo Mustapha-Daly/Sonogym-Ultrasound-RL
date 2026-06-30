@@ -6,6 +6,8 @@
 """
 Script to train RL agent with skrl.
 """
+# PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH ./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/skrl/train.py --task Isaac-robot-US-guidance-v0 --num_envs 8 --headless --enable_cameras
+#  CUDA_LAUNCH_BLOCKING=1 PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH ./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/skrl/train.py --task Isaac-robot-US-guidance-v0 --num_envs 8 --headless --enable_cameras
 
 # -----------------------------------------------------------------------------
 # Launch Isaac Sim first
@@ -99,6 +101,13 @@ from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
 from isaaclab_tasks.utils.hydra import hydra_task_config
+
+from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
+from skrl.memories.torch import RandomMemory
+from skrl.resources.schedulers.torch.kl_adaptive import KLAdaptiveLR
+from skrl.resources.preprocessors.torch.running_standard_scaler import RunningStandardScaler
+from skrl.trainers.torch import SequentialTrainer
+from spinal_surgery.lab.agents.skrl_actor_critic import SharedModel
 
 import wandb
 
@@ -243,7 +252,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # -----------------------------
     # wandb
     # -----------------------------
-    wandb.init(project=args_cli.task, config=agent_cfg)
+    wandb.init(project=args_cli.task, config=agent_cfg, entity="mustaphadaly-technical-university-of-munich", sync_tensorboard=True)
 
     # -----------------------------
     # create environment
@@ -276,19 +285,54 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # -----------------------------
     # training
     # -----------------------------
-    runner = Runner(env, agent_cfg)
+    device = env_cfg.sim.device
+
+    # SharedModel handles our dict observation {"image": (B,3,W,H), "pose": (B,12)}
+    # policy and value share the same CNN+MLP backbone (policy head = actions, value head = scalar)
+    models = {}
+    models["policy"] = SharedModel(env.observation_space, env.action_space, device)
+    models["value"] = models["policy"]
+
+    # build PPO config from YAML agent block, then override preprocessors with real classes
+    ppo_cfg = PPO_DEFAULT_CONFIG.copy()
+    ppo_cfg.update(agent_cfg.get("agent", {}))
+    if ppo_cfg.get("learning_rate_scheduler") == "KLAdaptiveLR":
+        ppo_cfg["learning_rate_scheduler"] = KLAdaptiveLR
+    if ppo_cfg.get("value_preprocessor") == "RunningStandardScaler":
+        ppo_cfg["value_preprocessor"] = RunningStandardScaler
+        ppo_cfg["value_preprocessor_kwargs"] = {"size": 1}
+
+    memory = RandomMemory(
+        memory_size=ppo_cfg.get("rollouts", 32),
+        num_envs=env.num_envs,
+        device=device,
+        replacement=False,
+    )
+
+    agent = PPO(
+        models=models,
+        memory=memory,
+        cfg=ppo_cfg,
+        observation_space=env.observation_space,
+        action_space=env.action_space,
+        device=device,
+    )
 
     # resume training if checkpoint provided
     if args_cli.checkpoint:
         resume_path = retrieve_file_path(args_cli.checkpoint)
         print(f"[INFO] Loading model checkpoint from: {resume_path}")
-        runner.agent.load(resume_path)
+        agent.load(resume_path)
+
+    trainer_cfg = agent_cfg.get("trainer", {})
+    trainer_cfg["timesteps"] = trainer_cfg.get("timesteps", 100000)
+    trainer = SequentialTrainer(cfg=trainer_cfg, env=env, agents=agent)
 
     print("[INFO] Expected checkpoints folder:")
     print(f"       {log_dir / 'checkpoints'}")
     print("[INFO] Training started...")
 
-    runner.run()
+    trainer.train()
 
     print("[INFO] Training finished.")
     print("[INFO] Checkpoints should be here:")

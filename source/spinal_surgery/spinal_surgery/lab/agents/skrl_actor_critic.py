@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 
@@ -8,30 +10,32 @@ from skrl.models.torch import Model, GaussianMixin, DeterministicMixin
 class StochasticActor(GaussianMixin, Model):
     def __init__(self, observation_space, action_space, device, clip_actions=False, clip_log_std=True, min_log_std=-20, max_log_std=2):
         Model.__init__(self, observation_space, action_space, device)
-        GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std)
+        GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std)               # hardcoded 4
 
-        self.features_extractor = nn.Sequential(nn.Conv2d(25, 32, kernel_size=8, stride=2),
-                                                nn.ReLU(),
-                                                nn.Conv2d(32, 64, kernel_size=4, stride=2),
-                                                nn.ReLU(),
-                                                nn.Conv2d(64, 64, kernel_size=3, stride=1),
-                                                nn.ReLU(),
-                                                nn.Flatten(),
-                                                )
-        self.net_features = nn.Linear(2048, 512)
+        self.features_extractor = nn.Sequential(
+            nn.Conv2d(observation_space['image'].shape[0], 32, kernel_size=8, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            dummy = torch.zeros(1, *observation_space['image'].shape)
+            cnn_flat_size = self.features_extractor(dummy).shape[1]
+        self.net_features = nn.Linear(cnn_flat_size, 512)
 
-        self.net_pos = nn.Sequential(nn.Linear(3, 128),
-                                     nn.ELU(),
-                                     nn.Linear(128, 128),
-                                     nn.ELU(),
-                                     nn.Linear(128, 64))
-        self.net_quat = nn.Sequential(nn.Linear(4, 128),
-                                      nn.ELU(),
-                                      nn.Linear(128, 128),
-                                      nn.ELU(),
-                                      nn.Linear(128, 64))
+        self.net_pose = nn.Sequential(
+            nn.Linear(observation_space['pose'].shape[0], 128),
+            nn.ELU(),
+            nn.Linear(128, 128),
+            nn.ELU(),
+            nn.Linear(128, 64),
+        )
 
-        self.net = nn.Sequential(nn.Linear(512 + 64 + 64, 256),
+
+        self.net = nn.Sequential(nn.Linear(512 + 64, 256),
                                  nn.ELU(),
                                  nn.Linear(256, 128),
                                  nn.ELU(),
@@ -44,16 +48,14 @@ class StochasticActor(GaussianMixin, Model):
         space = self.tensor_to_space(states, self.observation_space)
 
         image = space['image']
-        pos = space['pos']
-        quat = space['quat']
+        pose = space['pos']
 
         features = self.net_features(self.features_extractor(image))
-        pos_features = self.net_pos(pos)
-        quat_features = self.net_quat(quat)
+        pose_features = self.net_pos(pose)
 
         mean_actions = self.net(torch.cat([features,
-                                          pos_features,
-                                          quat_features], dim=-1))
+                                          pose_features,
+                                          ], dim=-1))
 
         return mean_actions, self.log_std_parameter, {}
     
@@ -118,57 +120,64 @@ class QNet(DeterministicMixin, Model):
         Model.__init__(self, observation_space, action_space, device)
         DeterministicMixin.__init__(self, clip_actions)
 
-        self.features_extractor = nn.Sequential(nn.Conv2d(observation_space['image'].shape[0], 32, kernel_size=8, stride=2),
-                                                nn.ReLU(),
-                                                nn.Conv2d(32, 64, kernel_size=4, stride=2),
-                                                nn.ReLU(),
-                                                nn.Conv2d(64, 64, kernel_size=3, stride=1),
-                                                nn.ReLU(),
-                                                nn.Flatten(),
-                                                )
-        self.net_features = nn.Linear(2048, 512)
+        # CNN reads 3-frame image stack — same as SharedModel
+        self.features_extractor = nn.Sequential(
+            nn.Conv2d(observation_space['image'].shape[0], 32, kernel_size=8, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
 
-        self.net_actions = nn.Sequential(nn.Linear(6, 128),
-                                        nn.ELU(),
-                                        nn.Linear(128, 128),
-                                        nn.ELU(),
-                                        nn.Linear(128, 64))
+        # compute CNN output size dynamically 
+        with torch.no_grad():
+            img_shape = observation_space['image'].shape
+            dummy = torch.zeros(1, *img_shape)
+            cnn_flat_size = self.features_extractor(dummy).shape[1]
+        self.net_features = nn.Linear(cnn_flat_size, 512)
 
-        self.net_pos = nn.Sequential(nn.Linear(3, 128),
-                                     nn.ELU(),
-                                     nn.Linear(128, 128),
-                                     nn.ELU(),
-                                     nn.Linear(128, 64))
-        self.net_quat = nn.Sequential(nn.Linear(4, 128),
-                                      nn.ELU(),
-                                      nn.Linear(128, 128),
-                                      nn.ELU(),
-                                      nn.Linear(128, 64))
+        # action branch: use action_space.shape[0] not hardcoded 6 (our action space is 4)
+        self.net_actions = nn.Sequential(
+            nn.Linear(action_space.shape[0], 128),
+            nn.ELU(),
+            nn.Linear(128, 128),
+            nn.ELU(),
+            nn.Linear(128, 64),
+        )
 
-        self.net = nn.Sequential(nn.Linear(512 + 64 + 64 + 64, 256),
-                                 nn.ELU(),
-                                 nn.Linear(256, 128),
-                                 nn.ELU(),
-                                 nn.Linear(128, 1))
+        # pose branch: 12-value history (3 frames × [x, z, angle, roll]) — same as SharedModel
+        self.net_pose = nn.Sequential(
+            nn.Linear(observation_space['pose'].shape[0], 128),
+            nn.ELU(),
+            nn.Linear(128, 128),
+            nn.ELU(),
+            nn.Linear(128, 64),
+        )
+
+        # head: image(512) + pose(64) + actions(64) = 640
+        self.net = nn.Sequential(
+            nn.Linear(512 + 64 + 64, 256),
+            nn.ELU(),
+            nn.Linear(256, 128),
+            nn.ELU(),
+            nn.Linear(128, 1),
+        )
 
     def compute(self, inputs, role):
         states = inputs["states"]
         actions = inputs["taken_actions"]
         space = self.tensor_to_space(states, self.observation_space)
 
-        image = space['image']
-        pos = space['pos']
-        quat = space['quat']
+        image = space['image']   # (B, 3, W, H)
+        pose = space['pose']     # (B, 12)
 
         features = self.net_features(self.features_extractor(image))
-        pos_features = self.net_pos(pos)
-        quat_features = self.net_quat(quat)
+        pose_features = self.net_pose(pose)
         action_features = self.net_actions(actions)
 
-        values = self.net(torch.cat([features,
-                                     pos_features,
-                                     quat_features,
-                                     action_features], dim=-1))
+        values = self.net(torch.cat([features, pose_features, action_features], dim=-1))
 
         return values, {}
     
@@ -180,41 +189,51 @@ class SharedModel(GaussianMixin, DeterministicMixin, Model):
         GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std, role="policy")
         DeterministicMixin.__init__(self, clip_actions, role="value")
 
-        self.features_extractor = nn.Sequential(nn.Conv2d(observation_space['image'].shape[0], 32, kernel_size=8, stride=2),
-                                                nn.ReLU(),
-                                                nn.Conv2d(32, 64, kernel_size=4, stride=2),
-                                                nn.ReLU(),
-                                                nn.Conv2d(64, 64, kernel_size=3, stride=1),
-                                                nn.ReLU(),
-                                                nn.Flatten(),
-                                                )
-        self.net_features = nn.Linear(2048, 512)
+        # CNN input:  3-frame image stack (B, 3, W, H)
+        self.features_extractor = nn.Sequential(
+            nn.Conv2d(observation_space['image'].shape[0], 32, kernel_size=8, stride=2), #Stride 2 = half the output size
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
 
-        self.net_pos = nn.Sequential(nn.Linear(3, 128),
-                                     nn.ELU(),
-                                     nn.Linear(128, 128),
-                                     nn.ELU(),
-                                     nn.Linear(128, 64))
-        self.net_quat = nn.Sequential(nn.Linear(4, 128),
-                                      nn.ELU(),
-                                      nn.Linear(128, 128),
-                                      nn.ELU(),
-                                      nn.Linear(128, 64))
+        #  CNN output 
+        with torch.no_grad():
+            img_shape = observation_space['image'].shape  # (3, W, H)
+            dummy = torch.zeros(1, *img_shape)
+            cnn_flat_size = self.features_extractor(dummy).shape[1]
+        self.net_features = nn.Linear(cnn_flat_size, 512) # compression into 512 numbers
 
-        self.net = nn.Sequential(nn.Linear(512 + 64 + 64, 256),
-                                 nn.ELU(),
-                                 nn.Linear(256, 128),
-                                 nn.ELU(),
-                                 nn.Linear(128, self.num_actions))
-        
-        self.net_value = nn.Sequential(nn.Linear(512 + 64 + 64, 256),
-                                 nn.ELU(),
-                                 nn.Linear(256, 128),
-                                 nn.ELU(),
-                                 nn.Linear(128, 1))
+        # MLP  12-value pose history (3 frames × [x, z, angle, roll])
+        self.net_pose = nn.Sequential(
+            nn.Linear(observation_space['pose'].shape[0], 128),
+            nn.ELU(),
+            nn.Linear(128, 128),
+            nn.ELU(),
+            nn.Linear(128, 64),
+        )
 
-        self.log_std_parameter = nn.Parameter(torch.zeros(self.num_actions))
+        self.net = nn.Sequential(
+            nn.Linear(512 + 64, 256),
+            nn.ELU(),
+            nn.Linear(256, 128),
+            nn.ELU(),
+            nn.Linear(128, self.num_actions),
+        )
 
+        self.net_value = nn.Sequential(
+            nn.Linear(512 + 64, 256),
+            nn.ELU(),
+            nn.Linear(256, 128),
+            nn.ELU(),
+            nn.Linear(128, 1),
+        )
+
+        # SKRL uses exp(log_std)
+        self.log_std_parameter = nn.Parameter(torch.full((self.num_actions,), math.log(0.5)))
     def act(self, inputs, role):
         if role == "policy":
             return GaussianMixin.act(self, inputs, role)
@@ -225,25 +244,17 @@ class SharedModel(GaussianMixin, DeterministicMixin, Model):
         states = inputs["states"]
         space = self.tensor_to_space(states, self.observation_space)
 
-        image = space['image']
-        pos = space['pos']
-        quat = space['quat']
+        image = space['image']   # (B, 3, W, H)
+        pose = space['pose']     # (B, 12)
 
         features = self.net_features(self.features_extractor(image))
-        pos_features = self.net_pos(pos)
-        quat_features = self.net_quat(quat)
+        pose_features = self.net_pose(pose)
+        combined = torch.cat([features, pose_features], dim=-1)
 
         if role == "policy":
-            mean_actions = self.net(torch.cat([features,
-                                                pos_features,
-                                                quat_features], dim=-1))
-
-            return mean_actions, self.log_std_parameter, {}
+            return self.net(combined), self.log_std_parameter, {}
         elif role == "value":
-            values = self.net_value(torch.cat([features,
-                                        pos_features,
-                                        quat_features], dim=-1))
-            return values, {}   
+            return self.net_value(combined), {}
 
 
 class SharedModelSAC(GaussianMixin, DeterministicMixin, Model):
