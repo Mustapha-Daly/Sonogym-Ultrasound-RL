@@ -209,7 +209,7 @@ class roboticUSEnvCfg(DirectRLEnvCfg):
     episode_length_s = scene_cfg["sim"]["episode_length"]  # 300
     action_scale = 1
     action_space = 4
-    observation_space = {"image": [3, 200, 150], "pose": [12]} # 3 frame image stack + 12 value pose history
+    observation_space = {"image": [6, 200, 150], "pose": [24]} # 3 frame image stack + 12 value pose history
     state_space = 0
     observation_scale = scene_cfg["observation"]["scale"]
     #VERTEBRA_LABEL_ID = 7
@@ -438,12 +438,12 @@ class roboticUSEnv(DirectRLEnv):
         # Added: observation space: image history + pose history as separate branches
         _W, _H = us_cfg["image_size"]
         self.observation_space = gym.spaces.Dict({
-            "image": gym.spaces.Box(low=0, high=255, shape=(3, _W, _H), dtype=np.float32),
-            "pose":  gym.spaces.Box(low=0.0, high=1.0, shape=(12,),     dtype=np.float32),
+            "image": gym.spaces.Box(low=0, high=255, shape=(6, _W, _H), dtype=np.float32),
+            "pose":  gym.spaces.Box(low=0.0, high=1.0, shape=(24,),     dtype=np.float32),
         })
         self.single_observation_space["policy"] = gym.spaces.Dict({
-            "image": gym.spaces.Box(low=0, high=255, shape=(3, _W, _H), dtype=np.float32),
-            "pose":  gym.spaces.Box(low=0.0, high=1.0, shape=(12,),     dtype=np.float32),
+            "image": gym.spaces.Box(low=0, high=255, shape=(6, _W, _H), dtype=np.float32),
+            "pose":  gym.spaces.Box(low=0.0, high=1.0, shape=(24,),     dtype=np.float32),
         })
 
         self.termination_direct = True
@@ -455,10 +455,16 @@ class roboticUSEnv(DirectRLEnv):
             .repeat(self.scene.num_envs, 1)
         )
 
-        self.w_pos = scene_cfg["reward"]["w_pos"]
-        self.w_liver = scene_cfg["reward"]["w_liver"]
-        self.w_bone  = scene_cfg["reward"]["w_bone"]
-        self.w_progress = scene_cfg["reward"]["w_progress"]
+        self.w_pos      = scene_cfg["reward"].get("w_pos", 0.0)
+        self.w_liver    = scene_cfg["reward"].get("w_liver", 0.0)
+        self.w_bone     = scene_cfg["reward"].get("w_bone", 0.0)
+        self.w_progress = scene_cfg["reward"].get("w_progress", 0.0)
+        self.w_coverage    = scene_cfg["reward"].get("w_coverage", 5.0)
+        self.shadow_thresh = scene_cfg["reward"].get("shadow_thresh", 0.15)
+        self.alpha1        = scene_cfg["reward"].get("alpha1", 1.0)
+        self.alpha2        = scene_cfg["reward"].get("alpha2", 0.5)
+        self.attenuation_Rc = scene_cfg["reward"].get("attenuation_Rc", 30.0)
+        self.terminal_bonus_kend = scene_cfg["reward"].get("terminal_bonus_kend", 0.0)
 
 
         self.single_action_space = gym.spaces.Box(
@@ -470,8 +476,8 @@ class roboticUSEnv(DirectRLEnv):
 
         self.num_step = 0
 
-        # Added:  Frame Buffer: holds last 3 Slices for every env
-        self.N_frames = 3
+        # Added:  Frame Buffer: holds last 6 Slices for every env
+        self.N_frames = 6
         _W, _H = us_cfg["image_size"]   # [W, H] from yaml
         self.frame_buffer = torch.zeros(
             self.scene.num_envs, self.N_frames, _W, _H,
@@ -738,6 +744,162 @@ class roboticUSEnv(DirectRLEnv):
             self.scanned_target_mask.append(
                 torch.zeros((num_envs, dx, dy, dz), dtype=torch.bool, device=self.sim.device)
             )
+        # Total target voxels per env
+        self.target_total_per_env = torch.zeros(num_envs, device=self.sim.device)
+        for b in range(num_envs):
+            hi = b % self.US_slicer.n_human_types
+            self.target_total_per_env[b] = self.target_total_voxels_list[hi]
+
+        # Cumulative rc sum per env within the current episode (reset each episode)
+        self.rc_episode_sum = torch.zeros(num_envs, device=self.sim.device)
+        self.reached_95 = torch.zeros(num_envs, dtype=torch.bool, device=self.sim.device)
+
+        # Per-episode accumulators for paper Eq. 6 terminal reward: D and P
+        self.episode_dist_sum   = torch.zeros(num_envs, device=self.sim.device)  # Σ dt/Rc
+        self.episode_rs_sum     = torch.zeros(num_envs, device=self.sim.device)  # Σ (1-pt)
+        self.episode_step_count = torch.zeros(num_envs, device=self.sim.device)  # T
+
+        # Run-wide accumulators for end-of-training summary
+        self.run_cov_sum = 0.0
+        self.run_term_sum = 0.0
+        self.run_ep_reward_sum = 0.0
+        self.run_done_count = 0
+
+        # Target center (x, z) in voxel space per env — used for attenuation distance ra
+        self.target_center_per_env = torch.zeros(num_envs, 2, device=self.sim.device)
+        for b in range(num_envs):
+            hi = b % self.US_slicer.n_human_types
+            x_min, x_max, _, _, z_min, z_max = self.target_bbox_list[hi]
+            self.target_center_per_env[b, 0] = (x_min + x_max) / 2.0  # cx
+            self.target_center_per_env[b, 1] = (z_min + z_max) / 2.0  # cz
+
+    def _init_voxel_visualizer(self):
+        """Create VisualizationMarkers for live 3D coverage display in Isaac Sim viewport.
+        Red spheres = unscanned target voxels, green spheres = scanned. Env 0 only."""
+        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+
+        cfg = VisualizationMarkersCfg(
+            prim_path="/World/Visuals/CoverageVoxels",
+            markers={
+                "unscanned": sim_utils.SphereCfg(
+                    radius=0.0015,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.2, 0.2)),
+                ),
+                "scanned": sim_utils.SphereCfg(
+                    radius=0.0015,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 1.0, 0.1)),
+                ),
+            },
+        )
+        self._voxel_markers = VisualizationMarkers(cfg)
+
+        # Pre-compute patient-space positions of all target voxels (fixed geometry)
+        x_min, x_max, y_min, y_max, z_min, z_max = self.target_bbox_list[0]
+        mask = self.target_mask_local_list[0]  # (dx, dy, dz) bool
+        lx, ly, lz = torch.where(mask)        # (N,) local indices inside bbox
+        gx = (lx + x_min).float()
+        gy = (ly + y_min).float()
+        gz = (lz + z_min).float()
+        self._target_voxel_patient_pos = torch.stack([gx, gy, gz], dim=1) * label_res  # (N,3) meters
+        self._viz_lx, self._viz_ly, self._viz_lz = lx, ly, lz
+
+    def _update_voxel_viz(self):
+        """Update 3D marker positions/colours each visualisation step."""
+        R_mat = matrix_from_quat(self.world_to_human_rot[0:1])[0]        # (3,3)
+        pts = self._target_voxel_patient_pos.to(self.sim.device)          # (N,3)
+        world_pos = (R_mat @ pts.T).T + self.world_to_human_pos[0]       # (N,3)
+
+        scanned = self.scanned_target_mask[0][0]                          # (dx,dy,dz) for env 0
+        scanned_flat = scanned[self._viz_lx, self._viz_ly, self._viz_lz] # (N,) bool
+        proto_indices = scanned_flat.long()                               # 0=red, 1=green
+
+        self._voxel_markers.visualize(translations=world_pos, marker_indices=proto_indices)
+
+    def _update_coverage(self):
+        """
+        Every step, we look up which pixels see target-sphere voxels,
+        find the unique voxels they map to,count how many of those are new
+        never seen before this episode), add the count to new_coverage_count
+        and permanently mark them as seen for the rest of this episode
+        This is used to compute a 3D coverage reward.
+       """
+        if not hasattr(self, "scanned_target_mask"):
+            return
+        if not hasattr(self.US_slicer, "last_sampled_coords_per_type"):
+            return
+
+        num_envs = self.scene.num_envs
+        n_types = self.US_slicer.n_human_types
+        self.new_coverage_count = torch.zeros(num_envs, device=self.sim.device)
+
+        # Gate: shadow fraction using same correct Nt as _get_rewards() (paper Eq. 4).
+        # _label_for_task is post-shadow so (!=0) gives only non-shadow scanned pixels.
+        # Must add shadow pixels back to get the true full scan area Nt.
+        if hasattr(self, "_shadow_mask_for_task") and hasattr(self, "_label_for_task"):
+            sh = self._shadow_mask_for_task   # (num_envs, H, W)
+            shadow_pix = sh.sum(dim=(1, 2)).float()
+            non_shadow_pix = (self._label_for_task != 0).sum(dim=(1, 2)).float()
+            Nt = (shadow_pix + non_shadow_pix).clamp(min=1.0)
+            shadow_frac_per_env = shadow_pix / Nt
+            shadow_ok = shadow_frac_per_env < self.shadow_thresh  # (num_envs,) bool
+        else:
+            shadow_ok = torch.ones(num_envs, dtype=torch.bool, device=self.sim.device)
+
+        for i in range(n_types):
+            env_inds = torch.arange(i, num_envs, n_types, device=self.sim.device)
+            B_i = env_inds.numel()
+
+            x_min, x_max, y_min, y_max, z_min, z_max = self.target_bbox_list[i]
+            target_mask_local = self.target_mask_local_list[i]  # (dx, dy, dz) bool
+            dx, dy, dz = target_mask_local.shape  # dimensions of the bounding box of target sphere
+
+            coords = self.US_slicer.last_sampled_coords_per_type[i]  # (B_i, W, H, E, 3)
+            coords_2d = coords[:, :, :, 0, :]            # (B_i, W, H, 3) — elevation 0
+
+            vx = coords_2d[..., 0]  # (B_i, W, H) — volume X axis
+            vy = coords_2d[..., 1]  # volume Y axis
+            vz = coords_2d[..., 2]  # volume Z axis
+
+            #  pixels  inside the target sphere's bounding box
+            in_bbox = (
+                (vx >= x_min) & (vx < x_max) &
+                (vy >= y_min) & (vy < y_max) &
+                (vz >= z_min) & (vz < z_max)
+            )  # (B_i, W, H)
+
+            # Convert global voxel coordinates to local coordinates 
+            lx = (vx - x_min).clamp(0, dx - 1).long()  # (B_i, W, H)
+            ly = (vy - y_min).clamp(0, dy - 1).long()
+            lz = (vz - z_min).clamp(0, dz - 1).long()
+
+            # is this local voxel actually inside the sphere 
+            is_target = target_mask_local[lx, ly, lz]   # (B_i, W, H) bool
+            hit = in_bbox & is_target                    # (B_i, W, H)
+
+            for b_local in range(B_i):
+                env_id = env_inds[b_local].item()
+                if not shadow_ok[env_id]:
+                    continue  # skip env if shadow fraction too high
+                hit_b = hit[b_local]  # (W, H)
+                if not hit_b.any(): #skip if no pixel hits the sphere
+                    continue
+
+                #flatten
+                lx_hit = lx[b_local][hit_b]
+                ly_hit = ly[b_local][hit_b]
+                lz_hit = lz[b_local][hit_b]
+
+                unique_coords = torch.unique(
+                    torch.stack([lx_hit, ly_hit, lz_hit], dim=1), dim=0
+                )  # (M, 3)
+                lx_u, ly_u, lz_u = unique_coords[:, 0], unique_coords[:, 1], unique_coords[:, 2]
+
+                # only voxels not yet seen in this episode are counted
+                not_yet = ~self.scanned_target_mask[i][env_id, lx_u, ly_u, lz_u]
+                self.new_coverage_count[env_id] += not_yet.sum()
+
+                # permanently mark as scanned for the rest of this episode
+                self.scanned_target_mask[i][env_id, lx_u, ly_u, lz_u] = True
 
     def _get_observations(self) -> dict:
         # -------------------------------------------------
@@ -800,10 +962,12 @@ class roboticUSEnv(DirectRLEnv):
             label_task_hw = self._apply_superficial_bone_shadow(label_hw)            # (B, H, W)
             self._label_for_task = label_task_hw
 
-            # shadow mask 
+            # shadow mask
             self._shadow_mask_for_task = (label_hw != 0) & (label_task_hw == 0)
 
-            # keep  existing frame-buffer layout (B, 1, W, H)
+            # Added: Update 3D coverage reward
+            self._update_coverage()
+
             current_frame = (
                 label_task_hw.permute(0, 2, 1).unsqueeze(1).float()
                 * self.cfg.observation_scale
@@ -898,8 +1062,9 @@ class roboticUSEnv(DirectRLEnv):
                     w_idx = int(TARGET_PICK_FRAC[1] * (W_img - 1))
 
                     voxel_at_pick = coords_oriented[0, h_idx, w_idx, 0]
-                    print(f"[TARGET PICK] voxel coords at frac={TARGET_PICK_FRAC} "
-                          f"(pixel h={h_idx},w={w_idx} of {H_img}x{W_img}): {voxel_at_pick.tolist()}")
+                    if not os.environ.get("SONOGYM_INFERENCE"):
+                        print(f"[TARGET PICK] voxel coords at frac={TARGET_PICK_FRAC} "
+                              f"(pixel h={h_idx},w={w_idx} of {H_img}x{W_img}): {voxel_at_pick.tolist()}")
 
                 # pick env 0 for plotting
                 label2d = label_hw[0]  # (H,W)
@@ -915,7 +1080,7 @@ class roboticUSEnv(DirectRLEnv):
                         plt.title(f"Segmentation mask for ID {k}")
                         plt.axis("off")
 
-                if self.num_step % 10 == 0:
+                if self.num_step % 10 == 0 and not os.environ.get("SONOGYM_INFERENCE"):
                     u = torch.unique(label2d)
                     print("Unique IDs in CURRENT slice:", u.detach().cpu().tolist())
                     
@@ -1050,7 +1215,7 @@ class roboticUSEnv(DirectRLEnv):
             min=-self.max_roll_adj,
             max=self.max_roll_adj,
         )
-        if self.num_step % 10 == 0:
+        if self.num_step % 10000 == 0:
 
             print(
                 f"[step {self.num_step}] "
@@ -1118,62 +1283,176 @@ class roboticUSEnv(DirectRLEnv):
             label = self.US_slicer.label_img_tensor[:, :, :, 0]
 
         B, H, W = label.shape
-        total_pixels = H * W
 
-        # Term 1: liver coverage
-        liver_mask = (label == self.cfg.LIVER_LABEL_ID)
-        liver_fraction = liver_mask.sum(dim=(1, 2)).float() / total_pixels
-
-        # Term 2: visible bone / cartilage
-        bone_mask = (label == 13) | (label == 15)
-        bone_fraction = bone_mask.sum(dim=(1, 2)).float() / total_pixels
-
-        # Term 3: black shadow caused by superficial bone
         if hasattr(self, "_shadow_mask_for_task"):
-            shadow_fraction = self._shadow_mask_for_task.sum(dim=(1, 2)).float() / total_pixels
+            shadow_pixels = self._shadow_mask_for_task.sum(dim=(1, 2)).float()   # n_shadow_t
+            non_shadow_pixels = (label != 0).sum(dim=(1, 2)).float()
+            Nt = (non_shadow_pixels + shadow_pixels).clamp(min=1.0)
+            shadow_fraction = shadow_pixels / Nt   # paper's pt = n_shadow_t / Nt
         else:
-            shadow_fraction = torch.zeros_like(liver_fraction)
+            shadow_fraction = torch.zeros(B, device=self.sim.device)
 
-        # Term 4: progress
-        if not hasattr(self, "prev_liver_fraction"):
-            self.prev_liver_fraction = torch.zeros_like(liver_fraction)
+        # Reward 1:  coverage level rc = nt / N
+        if hasattr(self, "new_coverage_count") and hasattr(self, "target_total_per_env"):
+            rc = self.new_coverage_count / self.target_total_per_env.clamp(min=1.0)
+        else:
+            rc = torch.zeros(B, device=self.sim.device)
 
-        progress = liver_fraction - self.prev_liver_fraction
-        progress = torch.clamp(progress, min=-0.05, max=0.05)
+        # Reward 2: attenuation minimization: ra = exp(-dt / Rc)
+        probe_xz = self.US_slicer.current_x_z_x_angle_cmd[:, :2]  # only [x, z] are considered
+        dt = torch.norm(probe_xz - self.target_center_per_env, dim=1) #euclidian distance
+        ra = torch.exp(-dt / self.attenuation_Rc)  # Result always in [0, 1]
 
-        reward = (
-            self.w_liver * liver_fraction
-            + self.w_progress * progress
-            - self.w_bone * (bone_fraction + 0.5 * shadow_fraction)
+        # Reward 3: shadow avoidance: rs = 1 - pt
+        rs = 1.0 - shadow_fraction  
+
+        #  combined per-step reward
+        rt = self.w_coverage * rc + self.alpha1 * ra + self.alpha2 * rs
+
+        # gate: use rt when shadow is acceptable, -0.1 otherwise (paper Eq. 7)
+        shadow_ok = shadow_fraction < self.shadow_thresh  # (B,) bool
+        reward = torch.where(
+            shadow_ok,
+            rt,
+            torch.full((B,), -0.1, device=self.sim.device),
         )
 
-        if wandb.run is not None and self.num_step % 50 == 0:
-            wandb.log({
-                "liver_fraction": liver_fraction.mean().item(),
-                "bone_fraction": bone_fraction.mean().item(),
-                "shadow_fraction": shadow_fraction.mean().item(),
-                "progress": progress.mean().item(),
-                "reward_mean": reward.mean().item(),
-            })
+        # accumulate D and P  
+        if hasattr(self, "episode_dist_sum"):
+            self.episode_dist_sum   += dt / self.attenuation_Rc
+            self.episode_rs_sum     += rs
+            self.episode_step_count += 1
 
-        self.prev_liver_fraction = liver_fraction.clone()
+        # terminal success bonus
+        # D = avg(dt/Rc) over episode,  P = avg(1-pt) over episode
+        if self.terminal_bonus_kend > 0.0 and hasattr(self, "scanned_target_mask") and hasattr(self, "target_total_per_env"):
+            n_types = self.US_slicer.n_human_types
+            scanned_total = torch.zeros(B, device=self.sim.device)
+            for i, mask in enumerate(self.scanned_target_mask):
+                env_inds = torch.arange(i, B, n_types, device=self.sim.device)
+                scanned_total[env_inds] = mask[env_inds].sum(dim=(1, 2, 3)).float()
+            cov_frac = scanned_total / self.target_total_per_env.clamp(min=1.0) #episode volume mean
+            T = self.episode_step_count.clamp(min=1.0) # number of steps in that episode
+            D = (self.episode_dist_sum / T).clamp(min=0.05)  # avg normalised distance; clamp avoids 1/D explosion
+            P = self.episode_rs_sum / T                       # avg shadow-free fraction
+            r_end = self.terminal_bonus_kend * (1.0 + self.alpha1 / D + self.alpha2 * P)
+            # add terminal bonus only on first crossing 0.95 (once per episode)
+            just_crossed = (cov_frac >= 0.95) & ~self.reached_95
+            self.reached_95 = self.reached_95 | (cov_frac >= 0.95)
+            reward = reward + torch.where(
+                just_crossed,
+                r_end,
+                torch.zeros(B, device=self.sim.device),
+            )
+
+        # accumulate rc across the episode (reset in _reset_idx)
+        if hasattr(self, "rc_episode_sum"):
+            self.rc_episode_sum += rc
+
+        # cache for episode-end logging in _get_dones()
+        self._wandb_cache = {
+            "ra_mean": ra.mean().item(),
+            "rs_mean": rs.mean().item(),
+            "shadow_ok_frac": shadow_ok.float().mean().item(),
+            "shadow_fraction": shadow_fraction.mean().item(),
+            "reward_mean": reward.mean().item(),
+            "reward_max": reward.max().item(),
+        }
+        self.total_reward += reward
+
         return reward
 
-    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]: # episode ends when liver is sufficiently visible or timeout
-        if self.observation_mode == "seg" and hasattr(self, "_label_for_task"):
-            label = self._label_for_task
+    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        num_envs = self.scene.num_envs
+        n_types = self.US_slicer.n_human_types
 
-        liver_mask = (label == self.cfg.LIVER_LABEL_ID)
-        liver_pixels = liver_mask.sum(dim=(1, 2))
-        H, W = label.shape[1], label.shape[2]
-        liver_fraction = liver_pixels / (H * W)
-        terminated = (liver_fraction > 0.85)
-        #terminated = (liver_fraction > 0.80) | self.US_slicer.no_collide 
+        # compute cumulative coverage fraction per env from the episode buffer
+        if hasattr(self, "scanned_target_mask") and hasattr(self, "target_total_per_env"):
+            scanned_total = torch.zeros(num_envs, device=self.sim.device)
+            for i, mask in enumerate(self.scanned_target_mask):
+                env_inds = torch.arange(i, num_envs, n_types, device=self.sim.device)
+                scanned_total[env_inds] = mask[env_inds].sum(dim=(1, 2, 3)).float()
+            coverage_fraction = scanned_total / self.target_total_per_env.clamp(min=1.0)
+        else:
+            coverage_fraction = torch.zeros(num_envs, device=self.sim.device)
+
+        terminated = torch.zeros(num_envs, dtype=torch.bool, device=self.sim.device)
+        success = coverage_fraction >= 0.95
 
         time_outs = self.episode_length_buf >= self.max_episode_length - 1
 
+        episode_done = terminated | time_outs
+
+        if os.environ.get("SONOGYM_INFERENCE") and episode_done.any():
+            for env_id in episode_done.nonzero(as_tuple=False).squeeze(-1).tolist():
+                outcome = "SUCCESS" if success[env_id] else "TIMEOUT"
+                print(f"[EPISODE END] env={env_id} | {outcome} | coverage={coverage_fraction[env_id]:.3f} | steps={self.episode_length_buf[env_id].item()}")
+
+        # rc reset
+        if hasattr(self, "rc_episode_sum") and episode_done.any():
+            rc_done_vals = self.rc_episode_sum[episode_done].tolist()
+            self.rc_episode_sum[episode_done] = 0.0
+        else:
+            rc_done_vals = []
+
+        if hasattr(self, "total_reward") and episode_done.any():
+            ep_reward_done_vals = self.total_reward[episode_done].tolist()
+        else:
+            ep_reward_done_vals = []
+
+        if episode_done.any():
+            done_count = int(episode_done.sum().item())
+            self.run_cov_sum += float(coverage_fraction[episode_done].sum().item())
+            self.run_term_sum += float(success[episode_done].float().sum().item())
+            self.run_ep_reward_sum += float(self.total_reward[episode_done].sum().item())
+            self.run_done_count += done_count
+            self.total_reward[episode_done] = 0.0
+
+        if wandb.run is not None and episode_done.any():
+            if not hasattr(self, "_ep_buf"):
+                self._ep_buf = {"cov": [], "term": [], "rc": [], "ep_reward": []}
+
+            self._ep_buf["cov"].extend(coverage_fraction[episode_done].tolist())
+            self._ep_buf["term"].extend(success[episode_done].float().tolist())
+            self._ep_buf["rc"].extend(rc_done_vals)
+            self._ep_buf["ep_reward"].extend(ep_reward_done_vals)
+
+            if len(self._ep_buf["cov"]) >= 8:
+                cov  = self._ep_buf["cov"]
+                term = self._ep_buf["term"]
+                rc   = self._ep_buf["rc"]
+                ep_reward = self._ep_buf["ep_reward"]
+                log_dict = getattr(self, "_wandb_cache", {}).copy()
+                log_dict["episode_volume_fraction_mean"] = sum(cov) / len(cov)
+                log_dict["episode_volume_fraction_max"]  = max(cov)
+                log_dict["episode_terminated_frac"]      = sum(term) / len(term)
+                if rc:
+                    log_dict["rc_episode_sum_mean"] = sum(rc) / len(rc)
+                    log_dict["rc_episode_sum_max"]  = max(rc)
+                if ep_reward:
+                    log_dict["episode_reward_mean"] = sum(ep_reward) / len(ep_reward)
+                    log_dict["episode_reward_max"]  = max(ep_reward)
+                if hasattr(self, "target_total_voxels_list"):
+                    log_dict["target_total_voxels"] = self.target_total_voxels_list[0]
+                wandb.log(log_dict)
+                self._ep_buf["cov"].clear()
+                self._ep_buf["term"].clear()
+                self._ep_buf["rc"].clear()
+                self._ep_buf["ep_reward"].clear()
+
         return terminated, time_outs
 
+    def get_run_metric_summary(self) -> dict[str, float]:
+        """Return exact run-wide episode means accumulated over all completed episodes."""
+        if self.run_done_count <= 0:
+            return {}
+        return {
+            "run_episode_volume_fraction_mean": self.run_cov_sum / self.run_done_count,
+            "run_episode_terminated_mean": self.run_term_sum / self.run_done_count,
+            "run_episode_reward_mean": self.run_ep_reward_sum / self.run_done_count,
+            "run_completed_episodes": float(self.run_done_count),
+        }
+ 
     def _move_towards_target(
         self,
         human_ee_target_pos: torch.Tensor,
@@ -1266,6 +1545,17 @@ class roboticUSEnv(DirectRLEnv):
         if hasattr(self, "scanned_target_mask"):
             for i in range(len(self.scanned_target_mask)):
                 self.scanned_target_mask[i][env_ids] = False
+
+        if hasattr(self, "rc_episode_sum"):
+            self.rc_episode_sum[env_ids] = 0.0
+
+        if hasattr(self, "reached_95"):
+            self.reached_95[env_ids] = False
+
+        if hasattr(self, "episode_dist_sum"):
+            self.episode_dist_sum[env_ids]   = 0.0
+            self.episode_rs_sum[env_ids]     = 0.0
+            self.episode_step_count[env_ids] = 0.0
 
         joint_pos = self.robot.data.default_joint_pos.clone()
         joint_vel = self.robot.data.default_joint_vel.clone()

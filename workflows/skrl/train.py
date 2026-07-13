@@ -279,6 +279,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
+    # Keep a direct handle to the task env so we can print end-of-run episode summaries
+    metric_env = env.unwrapped
+
     # wrap for skrl
     env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)
 
@@ -290,7 +293,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # SharedModel handles our dict observation {"image": (B,3,W,H), "pose": (B,12)}
     # policy and value share the same CNN+MLP backbone (policy head = actions, value head = scalar)
     models = {}
-    models["policy"] = SharedModel(env.observation_space, env.action_space, device)
+    _policy_cfg     = agent_cfg.get("models", {}).get("policy", {})
+    initial_log_std = _policy_cfg.get("initial_log_std", 0.0)
+    min_log_std     = _policy_cfg.get("min_log_std", -2.0)
+    max_log_std     = _policy_cfg.get("max_log_std", 1.0)
+    models["policy"] = SharedModel(env.observation_space, env.action_space, device,
+                                   min_log_std=min_log_std, max_log_std=max_log_std,
+                                   initial_log_std=initial_log_std)
     models["value"] = models["policy"]
 
     # build PPO config from YAML agent block, then override preprocessors with real classes
@@ -338,10 +347,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print("[INFO] Checkpoints should be here:")
     print(f"       {log_dir / 'checkpoints'}")
 
+    if hasattr(metric_env, "get_run_metric_summary"):
+        run_summary = metric_env.get_run_metric_summary()
+        if run_summary:
+                print(
+                    "[INFO] Final episode summary: "
+                    f"volume_fraction_mean={run_summary['run_episode_volume_fraction_mean']:.4f}, "
+                    f"terminated_mean={run_summary['run_episode_terminated_mean']:.4f}, "
+                    f"episode_reward_mean={run_summary['run_episode_reward_mean']:.4f}, "
+                    f"completed_episodes={int(run_summary['run_completed_episodes'])}"
+                )
+                if wandb.run is not None:
+                    wandb.run.summary["run_episode_volume_fraction_mean"] = run_summary["run_episode_volume_fraction_mean"]
+                    wandb.run.summary["run_episode_terminated_mean"] = run_summary["run_episode_terminated_mean"]
+                    wandb.run.summary["run_episode_reward_mean"] = run_summary["run_episode_reward_mean"]
+                    wandb.run.summary["run_completed_episodes"] = int(run_summary["run_completed_episodes"])
+
+    if wandb.run is not None:
+        wandb.finish()
+
     env.close()
 
 
 if __name__ == "__main__":
     main()
     simulation_app.close()
-

@@ -21,8 +21,8 @@ motion_planning:
   use_vertebra_goal: False
   vertebra_to_US_2d_pos: [0.0, 0.0]
   scale: [[5, 5, 0.1]]
-  max_roll_adj: 0.7
-  roll_init: -0.1125
+  max_roll_adj: 0.3
+  roll_init: 0.0
 
 observation: 
   3D: False
@@ -35,29 +35,35 @@ action:
   max_action: [4, 4, 0.5, 0.3]
 
 reward:
-  w_pos: 0.0
-  w_liver: 1.0
-  w_bone: 0.5
-  w_progress: 3.0
+  w_coverage: 5.0
+  shadow_thresh: 0.20
+  alpha1: 0.3
+  alpha2: 0.1
+  attenuation_Rc: 30.0
+  terminal_bonus_kend: 20.0  #  high reward on task success
 
 target_volume:
   enabled: True
   center_voxel: [206, 175, 226]   # from teleop pick, image-center frac (0.5,0.5) at confirmed intercostal pose
   radius_mm: 15
   label_id: 200
-
+  #Current: Radius_voxel = 15mm / 0.0015m = 10 voxels, 30mm x 30mm
+ 
 
 sim:
-  episode_length: 100 #ep_length/ dt* decimation (1/120 *2) in seconds
-  patient_xz_range: [[140, 80, -0.5], [280, 340, 0.5]]
-  patient_xz_init_range: [[239.09, 219.62, -0.0063], [239.09, 219.62, -0.0063]]
+  episode_length: 12 #ep_length in seconds → 12s × 60steps/s = 720 agent steps/episode
+  patient_xz_range: [[100, 120, -0.5], [270, 300, 0.5]]
+  patient_xz_init_range: [[166, 186, -0.5], [246, 266, 0.5]]  # ± 40 vox from center
+   
+  # Liver: X range : 120 – 248 Z range : 153 – 291
+
 
   if_use_ct: False
   ct_range: [-300, 3000]
   us: 'conv'
   vis_us: False  # True only for debfugging during training
   vis_int: 20
-  vis_seg_map: True # True only for debugging during training
+  vis_seg_map: False
 
 
 if_record_traj: False

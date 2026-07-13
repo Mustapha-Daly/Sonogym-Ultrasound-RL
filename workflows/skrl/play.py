@@ -6,6 +6,18 @@
 #~$ PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH ./isaaclab.sh -p $HOME/ws/sonogym/SonoGym/workflows/skrl/play.py   --task Isaac-robot-US-guidance-v0   --checkpoint /home/yue/IsaacLab/logs/skrl/US_guidance/2026-03-22_00-00-53_ppo_torch_PPO_US/checkpoints/best_agent.pt   --num_envs 16   --enable_cameras
 
 
+"""""
+cd ~/IsaacLab
+PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH \
+  ./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/skrl/play.py \
+  --task Isaac-robot-US-guidance-v0 \
+  --checkpoint ~/IsaacLab/logs/skrl/US_guidance/2026-07-10_06-19-54_ppo_torch_PPO_US/checkpoints/best_agent.pt \
+  --num_envs 1 \
+  --enable_cameras
+"""
+
+# ~/IsaacLab/logs/skrl/US_guidance/2026-07-11_17-41-50_ppo_torch_PPO_US/checkpoints/best_agent.pt \
+
 """
 Script to play a checkpoint of an RL agent from skrl.
 
@@ -81,10 +93,9 @@ if version.parse(skrl.__version__) < version.parse(SKRL_VERSION):
     )
     exit()
 
-if args_cli.ml_framework.startswith("torch"):
-    from skrl.utils.runner.torch import Runner
-elif args_cli.ml_framework.startswith("jax"):
-    from skrl.utils.runner.jax import Runner
+from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
+from skrl.memories.torch import RandomMemory
+from skrl.resources.preprocessors.torch.running_standard_scaler import RunningStandardScaler
 
 from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
 from isaaclab.utils.dict import print_dict
@@ -95,6 +106,7 @@ from isaaclab_rl.skrl import SkrlVecEnvWrapper
 import isaaclab_tasks  # noqa: F401
 import spinal_surgery
 from isaaclab_tasks.utils import get_checkpoint_path, load_cfg_from_registry, parse_env_cfg
+from spinal_surgery.lab.agents.skrl_actor_critic import SharedModel
 import wandb
 
 # PLACEHOLDER: Extension template (do not remove this comment)
@@ -136,6 +148,9 @@ def main():
         )
     log_dir = os.path.dirname(os.path.dirname(resume_path))
 
+    # signal to the env that we are in inference mode (enables episode-end console prints)
+    os.environ["SONOGYM_INFERENCE"] = "1"
+
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
@@ -167,17 +182,34 @@ def main():
     # wrap around environment for skrl
     env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)  # same as: `wrap_env(env, wrapper="auto")`
 
-    # configure and instantiate the skrl runner
-    # https://skrl.readthedocs.io/en/latest/api/utils/runner.html
-    experiment_cfg["trainer"]["close_environment_at_exit"] = False
-    experiment_cfg["agent"]["experiment"]["write_interval"] = 0  # don't log to TensorBoard
-    experiment_cfg["agent"]["experiment"]["checkpoint_interval"] = 0  # don't generate checkpoints
-    runner = Runner(env, experiment_cfg)
+    # build SharedModel  
+    _policy_cfg = experiment_cfg.get("models", {}).get("policy", {})
+    device = env_cfg.sim.device
+    models = {}
+    models["policy"] = SharedModel(
+        env.observation_space, env.action_space, device,
+        min_log_std=_policy_cfg.get("min_log_std", -3.0),
+        max_log_std=_policy_cfg.get("max_log_std", 1.0),
+        initial_log_std=_policy_cfg.get("initial_log_std", 0.0),
+    )
+    models["value"] = models["policy"]
+
+    ppo_cfg = PPO_DEFAULT_CONFIG.copy()
+    ppo_cfg.update(experiment_cfg.get("agent", {}))
+    if ppo_cfg.get("value_preprocessor") == "RunningStandardScaler":
+        ppo_cfg["value_preprocessor"] = RunningStandardScaler
+        ppo_cfg["value_preprocessor_kwargs"] = {"size": 1}
+    ppo_cfg["experiment"]["write_interval"] = 0
+    ppo_cfg["experiment"]["checkpoint_interval"] = 0
+
+    memory = RandomMemory(memory_size=1, num_envs=env.num_envs, device=device, replacement=False)
+    agent = PPO(models=models, memory=memory, cfg=ppo_cfg,
+                observation_space=env.observation_space,
+                action_space=env.action_space, device=device)
 
     print(f"[INFO] Loading model checkpoint from: {resume_path}")
-    runner.agent.load(resume_path)
-    # set agent to evaluation mode
-    runner.agent.set_running_mode("eval")
+    agent.load(resume_path)
+    agent.set_running_mode("eval")
 
     # reset environment
     obs, _ = env.reset()
@@ -189,7 +221,7 @@ def main():
         # run everything in inference mode
         with torch.inference_mode():
             # agent stepping
-            outputs = runner.agent.act(obs, timestep=0, timesteps=0)
+            outputs = agent.act(obs, timestep=0, timesteps=0)
             # - multi-agent (deterministic) actions
             if hasattr(env, "possible_agents"):
                 actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in env.possible_agents}

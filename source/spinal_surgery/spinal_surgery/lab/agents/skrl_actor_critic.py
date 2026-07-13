@@ -8,7 +8,7 @@ from skrl.models.torch import Model, GaussianMixin, DeterministicMixin
 
 
 class StochasticActor(GaussianMixin, Model):
-    def __init__(self, observation_space, action_space, device, clip_actions=False, clip_log_std=True, min_log_std=-20, max_log_std=2):
+    def __init__(self, observation_space, action_space, device, clip_actions=False, clip_log_std=True, min_log_std=-2, max_log_std=2):
         Model.__init__(self, observation_space, action_space, device)
         GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std)               # hardcoded 4
 
@@ -184,7 +184,7 @@ class QNet(DeterministicMixin, Model):
 
 
 class SharedModel(GaussianMixin, DeterministicMixin, Model):
-    def __init__(self, observation_space, action_space, device, clip_actions=False, clip_log_std=True, min_log_std=-20, max_log_std=2):
+    def __init__(self, observation_space, action_space, device, clip_actions=False, clip_log_std=True, min_log_std=-3.0, max_log_std=1.0, initial_log_std= -1.0):
         Model.__init__(self, observation_space, action_space, device)
         GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std, role="policy")
         DeterministicMixin.__init__(self, clip_actions, role="value")
@@ -232,8 +232,7 @@ class SharedModel(GaussianMixin, DeterministicMixin, Model):
             nn.Linear(128, 1),
         )
 
-        # SKRL uses exp(log_std)
-        self.log_std_parameter = nn.Parameter(torch.full((self.num_actions,), math.log(0.5)))
+        self.log_std_parameter = nn.Parameter(torch.full((self.num_actions,), initial_log_std))
     def act(self, inputs, role):
         if role == "policy":
             return GaussianMixin.act(self, inputs, role)

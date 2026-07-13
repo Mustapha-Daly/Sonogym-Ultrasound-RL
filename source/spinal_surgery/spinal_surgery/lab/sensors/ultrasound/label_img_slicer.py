@@ -183,6 +183,7 @@ class LabelImgSlicer(SurfaceMotionPlanner):
         self.human_img_coords = human_vox
 
         W, H, E = self.img_size[0], self.img_size[1], self.img_thickness
+        self.last_sampled_coords_per_type = {}  # reset each step; one entry per human type
 
         for i in range(self.n_human_types):
             inds = slice(i, None, self.n_human_types)
@@ -193,8 +194,9 @@ class LabelImgSlicer(SurfaceMotionPlanner):
                 print(f"[WARN] NaN in slicer coords (human_type={i}) — clamping to 0. Check IK/quaternion validity.")
                 coords_f = torch.nan_to_num(coords_f, nan=0.0)
             coords = coords_f.long()
-            # reshape to (B, W, H, E, 3) so it aligns 1:1 with label_img_tensor's (B, W, H, E) layout
+            # reshape to (B_i, W, H, E, 3) — B_i = envs belonging to this human type
             self.last_sampled_coords = coords.reshape(-1, W, H, E, 3)
+            self.last_sampled_coords_per_type[i] = self.last_sampled_coords
             sampled_label = self.label_maps[i][coords[:, :, 0], coords[:, :, 1], coords[:, :, 2]]
             sampled_ct = self.ct_maps[i][coords[:, :, 0], coords[:, :, 1], coords[:, :, 2]]
 
