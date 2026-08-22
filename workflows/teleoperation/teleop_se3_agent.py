@@ -1,7 +1,7 @@
 # Copyright (c) 2022-2024
 # SPDX-License-Identifier: BSD-3-Clause
 #cd ~/IsaacLab
-#PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH ./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/teleoperation/teleop_se3_agent.py --enable_cameras --task Isaac-robot-US-guidance-v0 --num_envs 8
+#PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH ./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/teleoperation/teleop_se3_agent.py --enable_cameras --task Isaac-robot-US-guidance-v0 --num_envs 1
 
 """
 Keyboard teleoperation for SonoGym ultrasound guidance task (Isaac Lab 5.x).
@@ -9,6 +9,7 @@ Keyboard teleoperation for SonoGym ultrasound guidance task (Isaac Lab 5.x).
 
 import argparse
 import cProfile
+import os
 
 from isaaclab.app import AppLauncher
 
@@ -81,7 +82,7 @@ def _make_actions(delta_pose_raw, device, num_envs):
 # Main
 # -----------------------------------------------------------------------------
 def main():
-    # Parse env config
+    os.environ["SONOGYN_TELEOP"] = "1"
     env_cfg = parse_env_cfg(
         args_cli.task,
         device=args_cli.device,
@@ -91,6 +92,7 @@ def main():
 
     # Create environment
     env = gym.make(args_cli.task, cfg=env_cfg)
+    raw_env = env.unwrapped
 
     print(f"[INFO] env.action_space = {env.action_space}")
     print(f"[INFO] num_envs = {env.unwrapped.num_envs}")
@@ -107,6 +109,7 @@ def main():
     # Reset
     env.reset()
     teleop_interface.reset()
+    step_count = 0
 
     # -----------------------------------------------------------------------------
     # Simulation loop
@@ -124,6 +127,16 @@ def main():
             )
 
             env.step(actions)
+            step_count += 1
+
+            if step_count % 50 == 0 and hasattr(raw_env, "US_slicer"):
+                print(
+                    f"[POSE {step_count}] "
+                    f"x={raw_env.US_slicer.current_x_z_x_angle_cmd[0, 0].item():.1f} "
+                    f"z={raw_env.US_slicer.current_x_z_x_angle_cmd[0, 1].item():.1f} "
+                    f"angle={raw_env.US_slicer.current_x_z_x_angle_cmd[0, 2].item():.3f} "
+                    f"roll={raw_env.US_slicer.roll_adj[0, 0].item():.3f}"
+                )
 
     env.close()
 

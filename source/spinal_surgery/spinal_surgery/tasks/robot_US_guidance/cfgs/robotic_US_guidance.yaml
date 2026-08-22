@@ -6,7 +6,7 @@ robot:
 patient:
   pos: [0.35, 0.15, 0.6]
   euler_yxz: [-90.0, 90.0, 0.0]
-  id_list: ['s0030'] #['s0015', 's0024', 's0028', 's0029', 's0030'] # ['s0010'] # 's0010', 's0014', 's0015'
+  id_list: ['s0030']
   label_res: 0.0015 # m
   target_anatomy: 'liver'
 
@@ -19,9 +19,9 @@ motion_planning:
   patient_xz_goal: [173.42, 221.67, -0.7125] #without bones: [173.42, 221.67, -0.7125] and roll= -0.7000 with bones: [[210, 270, 0.0] and roll =0.0
   #Optimal:_x=239.09, current_z=219.62, current_angle=-0.0063, current_roll=-0.1125
   use_vertebra_goal: False
-  vertebra_to_US_2d_pos: [0.0, 0.0]
+  vertebra_to_US_2d_pos: [0.0, 0.0] 
   scale: [[5, 5, 0.1]]
-  max_roll_adj: 0.3
+  max_roll_adj: 0.6
   roll_init: 0.0
 
 observation: 
@@ -31,37 +31,48 @@ observation:
   scale_net: 0.1
 action: 
   mode: 'continuous' # 'discrete', 'continuous'
-  scale: [2, 2, 0.25, 0.15]
-  max_action: [4, 4, 0.5, 0.3]
+  scale: [2, 2, 0.1, 0.2] #instead of [2, 2, 0.25, 0.15] — angle & roll finer for stable orientation/coverage
+  max_action: [4, 4, 0.2, 0.4] #instead of [4, 4, 0.2, 0.3]
 
 reward:
-  w_coverage: 5.0
+  w_coverage: 4.0 # was 1.0 — coverage (rc up to 0.8) not drowned by terminal bonus
   shadow_thresh: 0.20
-  alpha1: 0.3
-  alpha2: 0.1
-  attenuation_Rc: 30.0
+  alpha1: 0.00 # instead of 0.5
+  alpha2: 0.00 # instead of 0.1
+  attenuation_Rc: 100.0 # instead of 30
   terminal_bonus_kend: 20.0  #  high reward on task success
+  time_penalty: 0.02  # was 0.05 → 720×0.02=14.4 < terminal 20
+  alpha_vis: 2.5  # rv weight (visibility → dwell on target); raised 2.0→2.5 so partial glimpses beat the sweep pull
+  liver_frac_thresh: 0.15  # was 0.25 (unreachable — liver_frac maxed ~0.36)
+  liver_penalty_k: 0.25  # graded liver penalty scale: 0 in-liver → 0.1 fully outside
+  w_explore: 0.2  # visitation bonus per NEW (x,z) cell/episode 
+  explore_cell_size: 5.0  # voxels per exploration grid cell
+  explore_decay: 100  # steps before a visited cell is rewardable again
 
 target_volume:
   enabled: True
-  center_voxel: [206, 175, 226]   # from teleop pick, image-center frac (0.5,0.5) at confirmed intercostal pose
-  radius_mm: 15
+  center_voxel: [206, 175, 226]  # only Y=175 (depth) used when randomize: True; X/Z are overridden
+  radius_mm: 15  # 15mm / 1.5mm per vox = 10 voxels radius → ~4169 voxels
   label_id: 200
-  #Current: Radius_voxel = 15mm / 0.0015m = 10 voxels, 30mm x 30mm
- 
+  randomize: True
+  liver_x_range: [131, 235]  # actual liver X: 116–250, minus 15 vox safe margin each side
+  liver_z_range: [162, 279]  # actual liver Z: 147–294, minus 15 vox safe margin each side
+  #chose this range to avoid the liver edges and bones, and to avoid the liver being too close to the US probe at the start of the episode
 
 sim:
   episode_length: 12 #ep_length in seconds → 12s × 60steps/s = 720 agent steps/episode
-  patient_xz_range: [[100, 120, -0.5], [270, 300, 0.5]]
-  patient_xz_init_range: [[166, 186, -0.5], [246, 266, 0.5]]  # ± 40 vox from center
-   
-  # Liver: X range : 120 – 248 Z range : 153 – 291
+  patient_xz_range: [[131, 162, -1.5], [235, 279, 1.5]]  # liver bounds ±10 vox margin
+  patient_xz_init_range: [[160, 232, 1.5], [160, 232, 1.5]]  # ± 10 vox init range
+  #patient_xz_init_range: [[220, 162, -0.5], [235, 279, 0.5]]  #this is the range for randomized initial probe position, which is ± 20 voxels from the liver center. The liver center is at (x=203, z=168), so the range is x: 183–223, z: 148–188. This ensures that the probe starts within a reasonable distance from the liver and avoids starting too close to the edges of the liver or bones.
+  #  patient_xz_range: [[125, 152, -0.5], [245, 289, 0.5]]  # liver bounds ±10 vox margin
 
+  # Liver: X range : 116 – 250 Z range : 147 – 294
+  #good liver view: x 203 z 168
 
   if_use_ct: False
   ct_range: [-300, 3000]
   us: 'conv'
-  vis_us: False  # True only for debfugging during training
+  vis_us: True  # True only for debugging during training
   vis_int: 20
   vis_seg_map: False
 

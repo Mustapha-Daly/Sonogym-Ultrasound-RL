@@ -2,7 +2,7 @@
 # /isaaacsim
 # cd ~/IsaacLab
 # PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH ./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/teleoperation/teleop_se3_agent.py --enable_cameras --task Isaac-robot-US-guidance-v0 --num_envs 1
-#
+#CUDA_LAUNCH_BLOCKING=1 PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH ./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/skrl/train.py --task Isaac-robot-US-guidance-v0 --num_envs 4 --headless --enable_cameras
 
 '''
     keyboard name: Isaac Sim 5.1.0
@@ -80,6 +80,8 @@ import torch.nn.functional as F
 from isaaclab.sensors import Camera
 from isaaclab.sensors.camera import CameraCfg
 from isaaclab.sim.spawners.sensors import PinholeCameraCfg
+
+import matplotlib.pyplot as plt
 
 scene_cfg = YAML().load(
     open(f"{PACKAGE_DIR}/tasks/robot_US_guidance/cfgs/robotic_US_guidance.yaml", "r")
@@ -465,6 +467,13 @@ class roboticUSEnv(DirectRLEnv):
         self.alpha2        = scene_cfg["reward"].get("alpha2", 0.5)
         self.attenuation_Rc = scene_cfg["reward"].get("attenuation_Rc", 30.0)
         self.terminal_bonus_kend = scene_cfg["reward"].get("terminal_bonus_kend", 0.0)
+        self.time_penalty  = scene_cfg["reward"].get("time_penalty", 0.0)
+        self.alpha_vis     = scene_cfg["reward"].get("alpha_vis", 0.0)
+        self.liver_frac_thresh = scene_cfg["reward"].get("liver_frac_thresh", 0.0)  # min liver fraction in view for gate
+        self.liver_penalty_k = scene_cfg["reward"].get("liver_penalty_k", 0.1)  # graded liver-penalty scale
+        self.w_explore = scene_cfg["reward"].get("w_explore", 0.0)  # visitation bonus per NEW (x,z) cell/episode → drives deliberate sweep
+        self.explore_cell = scene_cfg["reward"].get("explore_cell_size", 5.0)  # voxels per exploration grid cell
+        self.explore_decay = int(scene_cfg["reward"].get("explore_decay", 50))  # steps before a visited cell is rewardable again; small=more re-sweeping, huge≈once/episode
 
 
         self.single_action_space = gym.spaces.Box(
@@ -603,31 +612,34 @@ class roboticUSEnv(DirectRLEnv):
         self.scene.articulations["robot_US"] = self.robot
         self.scene.rigid_objects["human"] = self.human
         # --------------------------------------------------
-        # RGB CAMERA (third-person debug camera)
+        # RGB CAMERA (third-person debug camera) — only when visualizing.
+        # Skipped during headless training so we can drop --enable_cameras and
+        # free the RTX rendering memory (this camera is NOT used by obs/reward).
         # --------------------------------------------------
-        self.rgb_camera = Camera(
-            CameraCfg(
-                prim_path="/World/envs/env_.*/ThirdPersonCamera",
-                width=640,
-                height=480,
-                data_types=["rgb"],
-                update_period=0.0,  # every sim frame
-                spawn=PinholeCameraCfg(
-                    focal_length=18.0,
-                    focus_distance=500.0,
-                    horizontal_aperture=20.955,
-                    clipping_range=(0.7, 50.0),
-                ),
-                offset=CameraCfg.OffsetCfg(
-                    pos=(-1.8, 0.6, 2.2),
-                    rot=(0.4, -0.7071, 0.05, 0.7071),
-                    convention="local",
-                ),
+        if scene_cfg["sim"]["vis_us"]:
+            self.rgb_camera = Camera(
+                CameraCfg(
+                    prim_path="/World/envs/env_.*/ThirdPersonCamera",
+                    width=640,
+                    height=480,
+                    data_types=["rgb"],
+                    update_period=0.0,  # every sim frame
+                    spawn=PinholeCameraCfg(
+                        focal_length=18.0,
+                        focus_distance=500.0,
+                        horizontal_aperture=20.955,
+                        clipping_range=(0.7, 50.0),
+                    ),
+                    offset=CameraCfg.OffsetCfg(
+                        pos=(-1.8, 0.6, 2.2),
+                        rot=(0.4, -0.7071, 0.05, 0.7071),
+                        convention="local",
+                    ),
+                )
             )
-        )
 
-        # register camera in scene
-        self.scene.sensors["third_person_camera"] = self.rgb_camera
+            # register camera in scene
+            self.scene.sensors["third_person_camera"] = self.rgb_camera
         
     def us_clarity_score(us_img: torch.Tensor) -> torch.Tensor:
         """
@@ -734,6 +746,112 @@ class roboticUSEnv(DirectRLEnv):
 
         self._init_coverage_buffers()
 
+    def _randomize_target(self, env_ids):
+        """Pick a new random (cx, cz) within liver bounds, restore old sphere, inject new one."""
+        target_cfg = scene_cfg.get("target_volume", {})
+        if not target_cfg.get("randomize", False):
+            return
+
+        radius_mm = float(target_cfg["radius_mm"])
+        radius_voxels = radius_mm / (self.US_slicer.label_res * 1000.0)
+        target_label_id = int(target_cfg["label_id"])
+        r_int = int(radius_voxels) + 1
+        margin = r_int + 1  # keep bbox fully inside volume at all times
+
+        x_lo, x_hi = target_cfg["liver_x_range"]
+        z_lo, z_hi = target_cfg["liver_z_range"]
+        cy = int(target_cfg["center_voxel"][1])  # Y (depth) stays fixed
+
+        # sphere_mask is position-independent: only relative offsets from center matter
+        offsets = torch.arange(-r_int, r_int + 1, device=self.sim.device)
+        xs_rel = offsets.view(-1, 1, 1)
+        ys_rel = offsets.view(1, -1, 1)
+        zs_rel = offsets.view(1, 1, -1)
+        sphere_mask = (xs_rel ** 2 + ys_rel ** 2 + zs_rel ** 2) <= radius_voxels ** 2
+        n_sphere = int(sphere_mask.sum().item())       # theoretical max (e.g. 4169)
+        min_target_voxels = int(0.99 * n_sphere)       # accept if ≥99% of sphere is liver (allows vessels)
+
+        for i in range(self.US_slicer.n_human_types):
+            label_map = self.US_slicer.label_maps[i]
+
+            # restore old sphere voxels back to liver
+            ox0, ox1, oy0, oy1, oz0, oz1 = self.target_bbox_list[i]
+            old_block = label_map[ox0:ox1, oy0:oy1, oz0:oz1]
+            old_block[self.target_mask_local_list[i]] = self.cfg.LIVER_LABEL_ID
+            label_map[ox0:ox1, oy0:oy1, oz0:oz1] = old_block
+
+            # retry until the full sphere fits entirely inside liver tissue
+            n_voxels = 0
+            write_mask = sphere_mask  # fallback if no perfect position found
+            x_min = x_max = y_min = y_max = z_min = z_max = 0
+            cx = cz = 0
+            for attempt in range(200):
+                cx = int(torch.randint(x_lo + margin, x_hi - margin + 1, (1,)).item())
+                cz = int(torch.randint(z_lo + margin, z_hi - margin + 1, (1,)).item())
+
+                x_min, x_max = cx - r_int, cx + r_int + 1
+                y_min, y_max = cy - r_int, cy + r_int + 1
+                z_min, z_max = cz - r_int, cz + r_int + 1
+
+                local_block = label_map[x_min:x_max, y_min:y_max, z_min:z_max]
+                liver_mask = local_block == self.cfg.LIVER_LABEL_ID
+                write_mask = sphere_mask & liver_mask # only voxels inside the sphere and liver are written
+                n_voxels = int(write_mask.sum().item())
+
+                if n_voxels >= min_target_voxels:  # ≥99% of sphere is liver tissue
+                    break
+
+            if n_voxels < min_target_voxels:
+                print(f"[TARGET WARNING] type={i}: could not reach {min_target_voxels} voxels after 200 tries. "
+                      f"Best: {n_voxels} at cx={cx} cz={cz}")
+            else:
+                print(f"[TARGET VOLUME] type={i}: cx={cx} cy={cy} cz={cz} → {n_voxels}/{n_sphere} voxels (full sphere in liver)")
+
+            # write confirmed position into label map
+            local_block = label_map[x_min:x_max, y_min:y_max, z_min:z_max]
+            local_block[write_mask] = target_label_id
+            label_map[x_min:x_max, y_min:y_max, z_min:z_max] = local_block
+
+            self.target_bbox_list[i] = (x_min, x_max, y_min, y_max, z_min, z_max)
+            self.target_mask_local_list[i] = write_mask.clone()
+            self.target_total_voxels_list[i] = n_voxels
+
+        # update ALL envs — shared target changed for everyone
+        num_envs = self.scene.num_envs
+        for b in range(num_envs):
+            hi = b % self.US_slicer.n_human_types
+            self.target_total_per_env[b] = self.target_total_voxels_list[hi]
+            x_min, x_max, _, _, z_min, z_max = self.target_bbox_list[hi]
+            self.target_center_per_env[b, 0] = (x_min + x_max) / 2.0
+            self.target_center_per_env[b, 1] = (z_min + z_max) / 2.0
+
+        # clear ALL scanned masks — progress toward old target is meaningless
+        if hasattr(self, "scanned_target_mask"):
+            for mask in self.scanned_target_mask:
+                mask[:] = False
+        # give ALL envs a fresh episode budget on the new target
+        self.episode_length_buf[:] = 0
+
+        if hasattr(self, "_prev_coords_per_type"):
+            self._prev_coords_per_type.clear()
+
+        if hasattr(self, "_target_round_log"):
+            self._reset_target_round_log()
+
+        if hasattr(self, "_voxel_markers"):
+            self._refresh_voxel_visualizer_geometry()
+
+    def _reset_target_round_log(self):
+        """Keep only one completed-episode sample per env for the current shared target."""
+        num_envs = self.scene.num_envs
+        self._target_round_log = {
+            "seen": torch.zeros(num_envs, dtype=torch.bool, device=self.sim.device),
+            "cov": torch.zeros(num_envs, device=self.sim.device),
+            "term": torch.zeros(num_envs, device=self.sim.device),
+            "rc": torch.zeros(num_envs, device=self.sim.device),
+            "ep_reward": torch.zeros(num_envs, device=self.sim.device),
+        }
+
     def _init_coverage_buffers(self):
         """Per-env boolean buffer tracking which target voxels have been scanned so far
         in the current episode. Reset every episode in _reset_idx."""
@@ -764,6 +882,7 @@ class roboticUSEnv(DirectRLEnv):
         self.run_term_sum = 0.0
         self.run_ep_reward_sum = 0.0
         self.run_done_count = 0
+        self._reset_target_round_log()
 
         # Target center (x, z) in voxel space per env — used for attenuation distance ra
         self.target_center_per_env = torch.zeros(num_envs, 2, device=self.sim.device)
@@ -772,7 +891,8 @@ class roboticUSEnv(DirectRLEnv):
             x_min, x_max, _, _, z_min, z_max = self.target_bbox_list[hi]
             self.target_center_per_env[b, 0] = (x_min + x_max) / 2.0  # cx
             self.target_center_per_env[b, 1] = (z_min + z_max) / 2.0  # cz
-
+     
+    # Added: 3D coverage visualizer for Isaac Sim viewport
     def _init_voxel_visualizer(self):
         """Create VisualizationMarkers for live 3D coverage display in Isaac Sim viewport.
         Red spheres = unscanned target voxels, green spheres = scanned. Env 0 only."""
@@ -782,18 +902,20 @@ class roboticUSEnv(DirectRLEnv):
             prim_path="/World/Visuals/CoverageVoxels",
             markers={
                 "unscanned": sim_utils.SphereCfg(
-                    radius=0.0015,
+                    radius=0.006,
                     visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.2, 0.2)),
                 ),
                 "scanned": sim_utils.SphereCfg(
-                    radius=0.0015,
+                    radius=0.006,
                     visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 1.0, 0.1)),
                 ),
             },
         )
         self._voxel_markers = VisualizationMarkers(cfg)
+        self._refresh_voxel_visualizer_geometry()
 
-        # Pre-compute patient-space positions of all target voxels (fixed geometry)
+    def _refresh_voxel_visualizer_geometry(self):
+        """Refresh cached target voxel geometry for the current target."""
         x_min, x_max, y_min, y_max, z_min, z_max = self.target_bbox_list[0]
         mask = self.target_mask_local_list[0]  # (dx, dy, dz) bool
         lx, ly, lz = torch.where(mask)        # (N,) local indices inside bbox
@@ -802,9 +924,12 @@ class roboticUSEnv(DirectRLEnv):
         gz = (lz + z_min).float()
         self._target_voxel_patient_pos = torch.stack([gx, gy, gz], dim=1) * label_res  # (N,3) meters
         self._viz_lx, self._viz_ly, self._viz_lz = lx, ly, lz
+        print(f"[VIZ] Coverage voxel markers initialized: {self._target_voxel_patient_pos.shape[0]} voxels at prim /World/Visuals/CoverageVoxels")
 
     def _update_voxel_viz(self):
         """Update 3D marker positions/colours each visualisation step."""
+        if not hasattr(self, "_target_voxel_patient_pos"):
+            self._init_voxel_visualizer()
         R_mat = matrix_from_quat(self.world_to_human_rot[0:1])[0]        # (3,3)
         pts = self._target_voxel_patient_pos.to(self.sim.device)          # (N,3)
         world_pos = (R_mat @ pts.T).T + self.world_to_human_pos[0]       # (N,3)
@@ -814,6 +939,41 @@ class roboticUSEnv(DirectRLEnv):
         proto_indices = scanned_flat.long()                               # 0=red, 1=green
 
         self._voxel_markers.visualize(translations=world_pos, marker_indices=proto_indices)
+
+    def _update_coverage_plot(self):
+        """Matplotlib 3D scatter showing red/green target voxels live """
+
+        if not hasattr(self, "_viz_lx"):
+            self._init_voxel_visualizer()
+
+        if not hasattr(self, "_cov_fig"):
+            self._cov_fig = plt.figure("3D Coverage")
+            self._cov_ax = self._cov_fig.add_subplot(111, projection="3d")
+
+        ax = self._cov_ax
+        ax.cla()
+
+        lx = self._viz_lx.cpu().numpy()
+        ly = self._viz_ly.cpu().numpy()
+        lz = self._viz_lz.cpu().numpy()
+        
+        #check which voxels have been scanned in env 0, type 0 (boolean output)
+        scanned = self.scanned_target_mask[0][0][self._viz_lx, self._viz_ly, self._viz_lz].cpu().numpy()
+
+        # X,Z = probe position axes; Y = depth axis — matches the patient orientation
+        if (~scanned).any():
+            ax.scatter(lx[~scanned], lz[~scanned], ly[~scanned], c="red",  s=1, alpha=0.3)
+        if scanned.any():
+            ax.scatter(lx[scanned],  lz[scanned],  ly[scanned],  c="lime", s=2, alpha=0.9)
+
+        n_s = int(scanned.sum())
+        n_t = len(scanned)
+        ax.set_title(f"Coverage  {n_s}/{n_t} = {n_s / n_t * 100:.1f}%")
+        ax.set_xlabel("X vox")
+        ax.set_ylabel("Z vox")
+        ax.set_zlabel("Y (depth)")
+        self._cov_fig.canvas.draw_idle()
+        plt.pause(0.001)
 
     def _update_coverage(self):
         """
@@ -831,10 +991,10 @@ class roboticUSEnv(DirectRLEnv):
         num_envs = self.scene.num_envs
         n_types = self.US_slicer.n_human_types
         self.new_coverage_count = torch.zeros(num_envs, device=self.sim.device)
+        # target voxels visible in the CURRENT slice (scanned or not) — same voxel
+        # units as coverage; used for the visibility reward rv
+        self.visible_target_count = torch.zeros(num_envs, device=self.sim.device)
 
-        # Gate: shadow fraction using same correct Nt as _get_rewards() (paper Eq. 4).
-        # _label_for_task is post-shadow so (!=0) gives only non-shadow scanned pixels.
-        # Must add shadow pixels back to get the true full scan area Nt.
         if hasattr(self, "_shadow_mask_for_task") and hasattr(self, "_label_for_task"):
             sh = self._shadow_mask_for_task   # (num_envs, H, W)
             shadow_pix = sh.sum(dim=(1, 2)).float()
@@ -853,53 +1013,75 @@ class roboticUSEnv(DirectRLEnv):
             target_mask_local = self.target_mask_local_list[i]  # (dx, dy, dz) bool
             dx, dy, dz = target_mask_local.shape  # dimensions of the bounding box of target sphere
 
-            coords = self.US_slicer.last_sampled_coords_per_type[i]  # (B_i, W, H, E, 3)
-            coords_2d = coords[:, :, :, 0, :]            # (B_i, W, H, 3) — elevation 0
+            curr_coords = self.US_slicer.last_sampled_coords_per_type[i]  #  the exact voxels that generated the 2d image(B_i, W, H, E, 3)
 
-            vx = coords_2d[..., 0]  # (B_i, W, H) — volume X axis
-            vy = coords_2d[..., 1]  # volume Y axis
-            vz = coords_2d[..., 2]  # volume Z axis
+            #  Added interpolation: sample 4 intermediate poses between previous and current
+            N_INTERP = 4
+            if hasattr(self, "_prev_coords_per_type") and i in self._prev_coords_per_type:
+                prev_c = self._prev_coords_per_type[i]
+                coords_list = (
+                    [prev_c + (k / (N_INTERP + 1)) * (curr_coords - prev_c) for k in range(1, N_INTERP + 1)]
+                    + [curr_coords]
+                )
+            else:
+                coords_list = [curr_coords]
 
-            #  pixels  inside the target sphere's bounding box
-            in_bbox = (
-                (vx >= x_min) & (vx < x_max) &
-                (vy >= y_min) & (vy < y_max) &
-                (vz >= z_min) & (vz < z_max)
-            )  # (B_i, W, H)
+            for c_idx, coords in enumerate(coords_list):
+                coords_2d = coords[:, :, :, 0, :]            # (B_i, W, H, 3) — elevation 0
 
-            # Convert global voxel coordinates to local coordinates 
-            lx = (vx - x_min).clamp(0, dx - 1).long()  # (B_i, W, H)
-            ly = (vy - y_min).clamp(0, dy - 1).long()
-            lz = (vz - z_min).clamp(0, dz - 1).long()
+                vx = coords_2d[..., 0]  # (B_i, W, H) — volume X axis
+                vy = coords_2d[..., 1]  # volume Y axis
+                vz = coords_2d[..., 2]  # volume Z axis
 
-            # is this local voxel actually inside the sphere 
-            is_target = target_mask_local[lx, ly, lz]   # (B_i, W, H) bool
-            hit = in_bbox & is_target                    # (B_i, W, H)
+                #  pixels  inside the target sphere's bounding box
+                in_bbox = (
+                    (vx >= x_min) & (vx < x_max) &
+                    (vy >= y_min) & (vy < y_max) &
+                    (vz >= z_min) & (vz < z_max)
+                )  # (B_i, W, H)
 
-            for b_local in range(B_i):
-                env_id = env_inds[b_local].item()
-                if not shadow_ok[env_id]:
-                    continue  # skip env if shadow fraction too high
-                hit_b = hit[b_local]  # (W, H)
-                if not hit_b.any(): #skip if no pixel hits the sphere
-                    continue
+                # Convert global voxel coordinates to local coordinates
+                lx = (vx - x_min).clamp(0, dx - 1).long()  # (B_i, W, H)
+                ly = (vy - y_min).clamp(0, dy - 1).long()
+                lz = (vz - z_min).clamp(0, dz - 1).long()
 
-                #flatten
-                lx_hit = lx[b_local][hit_b]
-                ly_hit = ly[b_local][hit_b]
-                lz_hit = lz[b_local][hit_b]
+                # is this local voxel actually inside the sphere
+                is_target = target_mask_local[lx, ly, lz]   # (B_i, W, H) bool
+                hit = in_bbox & is_target                    # (B_i, W, H)
 
-                unique_coords = torch.unique(
-                    torch.stack([lx_hit, ly_hit, lz_hit], dim=1), dim=0
-                )  # (M, 3)
-                lx_u, ly_u, lz_u = unique_coords[:, 0], unique_coords[:, 1], unique_coords[:, 2]
+                for b_local in range(B_i):
+                    env_id = env_inds[b_local].item()
+                    if not shadow_ok[env_id]:
+                        continue  # skip env if shadow fraction too high
+                    hit_b = hit[b_local]  # (W, H)
+                    if not hit_b.any(): #skip if no pixel hits the sphere
+                        continue
 
-                # only voxels not yet seen in this episode are counted
-                not_yet = ~self.scanned_target_mask[i][env_id, lx_u, ly_u, lz_u]
-                self.new_coverage_count[env_id] += not_yet.sum()
+                    #flatten
+                    lx_hit = lx[b_local][hit_b]
+                    ly_hit = ly[b_local][hit_b]
+                    lz_hit = lz[b_local][hit_b]
 
-                # permanently mark as scanned for the rest of this episode
-                self.scanned_target_mask[i][env_id, lx_u, ly_u, lz_u] = True
+                    unique_coords = torch.unique(
+                        torch.stack([lx_hit, ly_hit, lz_hit], dim=1), dim=0
+                    )  # (M, 3)
+                    lx_u, ly_u, lz_u = unique_coords[:, 0], unique_coords[:, 1], unique_coords[:, 2]
+
+                    # visibility: count target voxels seen in the CURRENT (last) frame
+                    # only — this is the current slice, not the swept interp path
+                    if c_idx == len(coords_list) - 1:
+                        self.visible_target_count[env_id] = float(unique_coords.shape[0])
+
+                    # only voxels not yet seen in this episode are counted
+                    not_yet = ~self.scanned_target_mask[i][env_id, lx_u, ly_u, lz_u]
+                    self.new_coverage_count[env_id] += not_yet.sum()
+
+                    # permanently mark as scanned for the rest of this episode
+                    self.scanned_target_mask[i][env_id, lx_u, ly_u, lz_u] = True
+
+            if not hasattr(self, "_prev_coords_per_type"):
+                self._prev_coords_per_type = {}
+            self._prev_coords_per_type[i] = curr_coords.detach()
 
     def _get_observations(self) -> dict:
         # -------------------------------------------------
@@ -1014,14 +1196,14 @@ class roboticUSEnv(DirectRLEnv):
         # -------------------------------------------------
         # Visualization
         # -------------------------------------------------
-        if self.sim_cfg["vis_us"] and self.num_step % self.sim_cfg["vis_int"] == 0:
+        if self.sim_cfg["vis_us"]:
             self.US_slicer.visualize("LABEL_RGB")
 
 
         # -------------------------------------------------
         # Debug (optional)
         # -------------------------------------------------
-        if self.sim.has_gui() and self.num_step % 30 == 0:
+        if self.sim.has_gui():
 
             import matplotlib.pyplot as plt
 
@@ -1062,84 +1244,74 @@ class roboticUSEnv(DirectRLEnv):
                     w_idx = int(TARGET_PICK_FRAC[1] * (W_img - 1))
 
                     voxel_at_pick = coords_oriented[0, h_idx, w_idx, 0]
-                    if not os.environ.get("SONOGYM_INFERENCE"):
-                        print(f"[TARGET PICK] voxel coords at frac={TARGET_PICK_FRAC} "
-                              f"(pixel h={h_idx},w={w_idx} of {H_img}x{W_img}): {voxel_at_pick.tolist()}")
+                    #if not os.environ.get("SONOGYM_INFERENCE"):
+                        #print(f"[TARGET PICK] voxel coords at frac={TARGET_PICK_FRAC} "
+                              #f"(pixel h={h_idx},w={w_idx} of {H_img}x{W_img}): {voxel_at_pick.tolist()}")
+                if not hasattr(self, "_viz_step"):
+                    self._viz_step = 0
+                self._viz_step += 1
 
-                # pick env 0 for plotting
-                label2d = label_hw[0]  # (H,W)
-                if self.num_step == 5:
-                    unique_ids = torch.unique(label2d)
+                # Isaac viewport coverage spheres: update EVERY step so they track
+                # the probe (cheap — just marker translations/colours, no mpl redraw)
+                if hasattr(self, "target_bbox_list"):
+                    self._update_voxel_viz()
 
-                    for k in unique_ids.cpu().tolist():
-                        mask = (label2d == k).cpu().numpy()
+                VIZ_EVERY = 1  # was 10; 1 = matplotlib in lock-step with the probe (slower). Try 2-3 if too slow.
+                if self._viz_step % VIZ_EVERY == 0:
+                    # pick env 0 for plotting
+                    label2d = label_hw[0]  # (H,W)
+                    palette = torch.zeros((256,3), dtype=torch.uint8, device=label2d.device)
 
-                        import matplotlib.pyplot as plt
-                        plt.figure(f"Label ID {k}")
-                        plt.imshow(mask, cmap="gray")
-                        plt.title(f"Segmentation mask for ID {k}")
-                        plt.axis("off")
+                    palette[0]  = torch.tensor([0,0,0], device=label2d.device)        # background
+                    palette[1]  = torch.tensor([255,255,0], device=label2d.device)    # spleen
+                    palette[63] = torch.tensor([160, 160, 255], device=label2d.device)  # IVC
+                    palette[8]  = torch.tensor([0,255,255], device=label2d.device)    # muscle
+                    palette[10] = torch.tensor([255, 165, 0], device=label2d.device)  # organ tissue
+                    palette[12] = torch.tensor([144,238,144], device=label2d.device)      # skin / fat
+                    palette[13] = torch.tensor([255,0,0], device=label2d.device)      # bone
+                    palette[5] = torch.tensor([0,0,200], device=label2d.device)  # main organ class
+                    palette[64] = torch.tensor([0, 100, 255], device=label2d.device)  # Portal Vein
+                    palette[6] = torch.tensor([148,0,211], device=label2d.device)      # Stomach
+                    palette[7] = torch.tensor([139, 69, 19], device=label2d.device)  # pancreas
+                    palette[4] = torch.tensor([255, 255, 255], device=label2d.device)  # gallbladder
+                    palette[15] = torch.tensor([255, 105, 180], device=label2d.device)  # costal cartilages
+                    palette[52] = torch.tensor([245, 222, 179], device=label2d.device)  # aorta
+                    palette[200] = torch.tensor([0, 255, 0], device=label2d.device)  # target volume
 
-                if self.num_step % 10 == 0 and not os.environ.get("SONOGYM_INFERENCE"):
-                    u = torch.unique(label2d)
-                    print("Unique IDs in CURRENT slice:", u.detach().cpu().tolist())
-                    
-                
-                palette = torch.zeros((256,3), dtype=torch.uint8, device=label2d.device)
+                    rgb = palette[label2d].detach().cpu().numpy()  # (H,W,3)
+                    ct_wh = self.US_slicer.ct_img_tensor[..., 0]
+                    ct_hw = self._orient_convex_hw(ct_wh)[0].detach().cpu().numpy()
+                    ct_hw = (ct_hw - ct_hw.min()) / (ct_hw.max() - ct_hw.min() + 1e-6)
 
-                palette[0]  = torch.tensor([0,0,0], device=label2d.device)        # background
-                palette[1]  = torch.tensor([255,255,0], device=label2d.device)    # spleen
-                palette[63] = torch.tensor([160, 160, 255], device=label2d.device)  # IVC
-                palette[8]  = torch.tensor([0,255,255], device=label2d.device)    # muscle
-                palette[10] = torch.tensor([255, 165, 0], device=label2d.device)  # organ tissue
-                palette[12] = torch.tensor([144,238,144], device=label2d.device)      # skin / fat
-                palette[13] = torch.tensor([255,0,0], device=label2d.device)      # bone
-                palette[5] = torch.tensor([0,0,200], device=label2d.device)  # main organ class
-                palette[64] = torch.tensor([0, 100, 255], device=label2d.device)  # Portal Vein
-                palette[6] = torch.tensor([148,0,211], device=label2d.device)      # Stomach
-                palette[7] = torch.tensor([139, 69, 19], device=label2d.device)  # pancreas
-                palette[4] = torch.tensor([255, 255, 255], device=label2d.device)  # gallbladder
-                palette[15] = torch.tensor([255, 105, 180], device=label2d.device)  # costal cartilages
-                palette[52] = torch.tensor([245, 222, 179], device=label2d.device)  # aorta
-                palette[200] = torch.tensor([0, 255, 0], device=label2d.device)  # target volume
-
-
-                rgb = palette[label2d].detach().cpu().numpy()  # (H,W,3)
-                # --- get CT slice for overlay ---
-                ct_wh = self.US_slicer.ct_img_tensor[..., 0]
-                ct_hw = self._orient_convex_hw(ct_wh)[0].detach().cpu().numpy()
-                ct_hw = (ct_hw - ct_hw.min()) / (ct_hw.max() - ct_hw.min() + 1e-6)
-
-
-                plt.figure("Convex Semantic Label")
-                plt.clf()
-                plt.imshow(ct_hw , cmap="gray")
-                plt.imshow(rgb ,alpha=1.0, interpolation="nearest")
-                #plt.imshow(rgb, interpolation="nearest")
-                #plt.imshow(rgb[::-1], interpolation="nearest")
-                plt.title("Convex Label Map (Semantic RGB)")
-                plt.axis("off")
-                import matplotlib.patches as mpatches 
-                legend_items = [
-                    mpatches.Patch(color=(0, 0, 0), label="Background (ID 0)"),
-                    mpatches.Patch(color=(1,1,0), label="Spleen (ID 1)"), 
-                    mpatches.Patch(color=(160/255, 160/255, 1), label="IVC (ID 63)"),
-                    mpatches.Patch(color=(0,1,1), label="Muscle (ID 8)"),
-                    mpatches.Patch(color=(1, 165/255, 0), label="Organ tissue (ID 10)"),
-                    mpatches.Patch(color=(0.56,0.93,0.56), label="Skin / Fat (ID 12)"),
-                    mpatches.Patch(color=(1,0,0), label="Bone / Vertebra (ID 13)"),
-                    mpatches.Patch(color=(0,0,0.6), label="Liver (ID 5)"),
-                    mpatches.Patch(color=(0, 100/255, 1), label="Portal Vein (ID 64)"),
-                    mpatches.Patch(color=(148/255, 0, 211/255), label="Stomach (ID 6)"),
-                    mpatches.Patch(color=(139/255, 69/255, 19/255), label="Pancreas (ID 7)"), 
-                    mpatches.Patch(color=(1, 1, 1), label="Gallbladder (ID 4)"), 
-                    mpatches.Patch(color=(1, 105/255, 180/255), label="Costal Cartilages (ID 15)"),
-                    mpatches.Patch(color=(245/255, 222/255, 179/255), label="Aorta (ID 52)"),
-                    mpatches.Patch(color=(0, 1, 0), label="Target Volume (ID 200)"),
-
-                ]
-                plt.legend(handles=legend_items,loc="center left",bbox_to_anchor=(1.02, 0.5),frameon=True)
-                plt.pause(0.001)
+                    plt.figure("Convex Semantic Label")
+                    plt.clf()
+                    plt.imshow(ct_hw, cmap="gray")
+                    plt.imshow(rgb, alpha=1.0, interpolation="nearest")
+                    plt.title("Convex Label Map (Semantic RGB)")
+                    plt.axis("off")
+                    import matplotlib.patches as mpatches
+                    legend_items = [
+                        mpatches.Patch(color=(0, 0, 0), label="Background (ID 0)"),
+                        mpatches.Patch(color=(1,1,0), label="Spleen (ID 1)"),
+                        mpatches.Patch(color=(160/255, 160/255, 1), label="IVC (ID 63)"),
+                        mpatches.Patch(color=(0,1,1), label="Muscle (ID 8)"),
+                        mpatches.Patch(color=(1, 165/255, 0), label="Organ tissue (ID 10)"),
+                        mpatches.Patch(color=(0.56,0.93,0.56), label="Skin / Fat (ID 12)"),
+                        mpatches.Patch(color=(1,0,0), label="Bone / Vertebra (ID 13)"),
+                        mpatches.Patch(color=(0,0,0.6), label="Liver (ID 5)"),
+                        mpatches.Patch(color=(0, 100/255, 1), label="Portal Vein (ID 64)"),
+                        mpatches.Patch(color=(148/255, 0, 211/255), label="Stomach (ID 6)"),
+                        mpatches.Patch(color=(139/255, 69/255, 19/255), label="Pancreas (ID 7)"),
+                        mpatches.Patch(color=(1, 1, 1), label="Gallbladder (ID 4)"),
+                        mpatches.Patch(color=(1, 105/255, 180/255), label="Costal Cartilages (ID 15)"),
+                        mpatches.Patch(color=(245/255, 222/255, 179/255), label="Aorta (ID 52)"),
+                        mpatches.Patch(color=(0, 1, 0), label="Target Volume (ID 200)"),
+                    ]
+                    plt.legend(handles=legend_items, loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=True)
+                    plt.pause(0.001)
+                    if hasattr(self, "target_bbox_list"):
+                        # _update_voxel_viz() now runs every step above (outside this gate)
+                        self._update_coverage_plot()
 
             elif self.observation_mode == "CT":
                 ct_wh = self.US_slicer.ct_img_tensor[..., 0]          # (B, W, H)
@@ -1166,9 +1338,6 @@ class roboticUSEnv(DirectRLEnv):
             x_cmd = self.US_slicer.current_x_z_x_angle_cmd[0, 0].int()
             z_cmd = self.US_slicer.current_x_z_x_angle_cmd[0, 1].int()
             normal_human = self.US_slicer.surface_normal_list[0][x_cmd, z_cmd]
-
-
-          
 
         return observations
 
@@ -1306,16 +1475,61 @@ class roboticUSEnv(DirectRLEnv):
         # Reward 3: shadow avoidance: rs = 1 - pt
         rs = 1.0 - shadow_fraction  
 
-        #  combined per-step reward
-        rt = self.w_coverage * rc + self.alpha1 * ra + self.alpha2 * rs
+        # Reward 4: target visibility rv = fraction of target VOXELS currently imaged.
+        # how many of the target voxels are visible in the current slice (computed in update coverage)
+        # Difference from rc: rc says covers whole sphere and rv says keep it in view while you do
+        if hasattr(self, "visible_target_count") and hasattr(self, "target_total_per_env"):
+            rv = self.visible_target_count / self.target_total_per_env.clamp(min=1.0)
+        else:
+            rv = torch.zeros(B, device=self.sim.device)
 
-        # gate: use rt when shadow is acceptable, -0.1 otherwise (paper Eq. 7)
+        # Reward 5: exploration (visitation) reward: bonus for entering a NEW (x,z) cell 
+        if self.w_explore > 0.0:
+            probe_xz = self.US_slicer.current_x_z_x_angle_cmd[:, :2]  # (B, 2) voxel coords
+            if not hasattr(self, "_visited_step"):
+                xzr = self.sim_cfg["patient_xz_range"]
+                self._ex_x0, self._ex_z0 = xzr[0][0], xzr[0][1]
+                self._ex_nx = int((xzr[1][0] - xzr[0][0]) / self.explore_cell) + 2
+                self._ex_nz = int((xzr[1][1] - xzr[0][1]) / self.explore_cell) + 2
+                # episode-step each cell was last visited; -large = never visited → rewardable
+                self._visited_step = torch.full((B, self._ex_nx, self._ex_nz), -(10**9), dtype=torch.long, device=self.sim.device)
+            cx = ((probe_xz[:, 0] - self._ex_x0) / self.explore_cell).long().clamp(0, self._ex_nx - 1)
+            cz = ((probe_xz[:, 1] - self._ex_z0) / self.explore_cell).long().clamp(0, self._ex_nz - 1)
+            eidx = torch.arange(B, device=self.sim.device)
+            now = self.episode_length_buf                       # (B,) step within each env's episode
+            age = now - self._visited_step[eidx, cx, cz]        # steps since this cell was last visited
+            new_cell = age >= self.explore_decay                # rewardable again once it has "decayed"
+            self._visited_step[eidx, cx, cz] = now              # stamp current visit
+            r_explore = self.w_explore * new_cell.float()  # decaying visitation → forces continual re-sweeping of the whole liver
+        else:
+            r_explore = torch.zeros(B, device=self.sim.device)
+
+        # while the target is in view, switch OFF exploration → dwell and scan instead of
+        # being pulled away to sweep fresh cells (rc still drives the on-target scan motion)
+        if hasattr(self, "visible_target_count"):
+            r_explore = torch.where(
+                self.visible_target_count > 0,
+                torch.zeros_like(r_explore),
+                r_explore,
+            )
+
+        #  combined per-step reward
+        rt = self.w_coverage * rc + self.alpha1 * ra + self.alpha2 * rs + self.alpha_vis * rv + r_explore
+
+        # shadow penalty + liver penatly, graded by how far below threshold 
         shadow_ok = shadow_fraction < self.shadow_thresh  # (B,) bool
-        reward = torch.where(
+        liver_frac = (label == self.cfg.LIVER_LABEL_ID).float().mean(dim=(1, 2))  # (B,)
+        liver_deficit = (self.liver_frac_thresh - liver_frac).clamp(min=0.0)
+        liver_penalty = self.liver_penalty_k * (liver_deficit / max(self.liver_frac_thresh, 1e-6))  # 0 in-liver → k fully outside
+        shadow_penalty = torch.where(
             shadow_ok,
-            rt,
-            torch.full((B,), -0.1, device=self.sim.device),
+            torch.zeros(B, device=self.sim.device),
+            torch.full((B,), 0.1, device=self.sim.device),
         )
+        reward = rt - liver_penalty - shadow_penalty
+
+        # per-step living cost: each extra step lowers the return 
+        # encourages finishing fast
 
         # accumulate D and P  
         if hasattr(self, "episode_dist_sum"):
@@ -1336,7 +1550,7 @@ class roboticUSEnv(DirectRLEnv):
             D = (self.episode_dist_sum / T).clamp(min=0.05)  # avg normalised distance; clamp avoids 1/D explosion
             P = self.episode_rs_sum / T                       # avg shadow-free fraction
             r_end = self.terminal_bonus_kend * (1.0 + self.alpha1 / D + self.alpha2 * P)
-            # add terminal bonus only on first crossing 0.95 (once per episode)
+            # add terminal bonus only on first crossing 0.85 (once per episode)
             just_crossed = (cov_frac >= 0.95) & ~self.reached_95
             self.reached_95 = self.reached_95 | (cov_frac >= 0.95)
             reward = reward + torch.where(
@@ -1352,6 +1566,8 @@ class roboticUSEnv(DirectRLEnv):
         # cache for episode-end logging in _get_dones()
         self._wandb_cache = {
             "ra_mean": ra.mean().item(),
+            "rv_mean": rv.mean().item(),
+            "liver_frac_mean": liver_frac.mean().item(),
             "rs_mean": rs.mean().item(),
             "shadow_ok_frac": shadow_ok.float().mean().item(),
             "shadow_fraction": shadow_fraction.mean().item(),
@@ -1366,18 +1582,26 @@ class roboticUSEnv(DirectRLEnv):
         num_envs = self.scene.num_envs
         n_types = self.US_slicer.n_human_types
 
-        # compute cumulative coverage fraction per env from the episode buffer
+        # pending synchronized reset: flush all envs through the proper done path
+        if getattr(self, "_pending_sync_reset", False):
+            terminated = torch.zeros(num_envs, dtype=torch.bool, device=self.sim.device)
+            time_outs  = torch.ones(num_envs,  dtype=torch.bool, device=self.sim.device)
+            return terminated, time_outs
+
+        # compute cumulative coverage fraction per env 
         if hasattr(self, "scanned_target_mask") and hasattr(self, "target_total_per_env"):
             scanned_total = torch.zeros(num_envs, device=self.sim.device)
             for i, mask in enumerate(self.scanned_target_mask):
                 env_inds = torch.arange(i, num_envs, n_types, device=self.sim.device)
                 scanned_total[env_inds] = mask[env_inds].sum(dim=(1, 2, 3)).float()
-            coverage_fraction = scanned_total / self.target_total_per_env.clamp(min=1.0)
+            coverage_fraction = (scanned_total / self.target_total_per_env.clamp(min=1.0)).clamp(max=1.0)
         else:
             coverage_fraction = torch.zeros(num_envs, device=self.sim.device)
 
         terminated = torch.zeros(num_envs, dtype=torch.bool, device=self.sim.device)
-        success = coverage_fraction >= 0.95
+        terminated |= (coverage_fraction >= 0.95)
+        # success =  85% coverage  400 steps
+        success = (coverage_fraction >= 0.95) & (self.episode_length_buf <= 250)
 
         time_outs = self.episode_length_buf >= self.max_episode_length - 1
 
@@ -1389,16 +1613,14 @@ class roboticUSEnv(DirectRLEnv):
                 print(f"[EPISODE END] env={env_id} | {outcome} | coverage={coverage_fraction[env_id]:.3f} | steps={self.episode_length_buf[env_id].item()}")
 
         # rc reset
+        rc_done_tensor = torch.zeros(num_envs, device=self.sim.device)
         if hasattr(self, "rc_episode_sum") and episode_done.any():
-            rc_done_vals = self.rc_episode_sum[episode_done].tolist()
+            rc_done_tensor[episode_done] = self.rc_episode_sum[episode_done]
             self.rc_episode_sum[episode_done] = 0.0
-        else:
-            rc_done_vals = []
 
+        ep_reward_done_tensor = torch.zeros(num_envs, device=self.sim.device)
         if hasattr(self, "total_reward") and episode_done.any():
-            ep_reward_done_vals = self.total_reward[episode_done].tolist()
-        else:
-            ep_reward_done_vals = []
+            ep_reward_done_tensor[episode_done] = self.total_reward[episode_done]
 
         if episode_done.any():
             done_count = int(episode_done.sum().item())
@@ -1409,36 +1631,30 @@ class roboticUSEnv(DirectRLEnv):
             self.total_reward[episode_done] = 0.0
 
         if wandb.run is not None and episode_done.any():
-            if not hasattr(self, "_ep_buf"):
-                self._ep_buf = {"cov": [], "term": [], "rc": [], "ep_reward": []}
+            if not hasattr(self, "_target_round_log"):
+                self._reset_target_round_log()
 
-            self._ep_buf["cov"].extend(coverage_fraction[episode_done].tolist())
-            self._ep_buf["term"].extend(success[episode_done].float().tolist())
-            self._ep_buf["rc"].extend(rc_done_vals)
-            self._ep_buf["ep_reward"].extend(ep_reward_done_vals)
+            record_mask = episode_done & ~self._target_round_log["seen"]
+            if record_mask.any():
+                self._target_round_log["seen"][record_mask] = True
+                self._target_round_log["cov"][record_mask] = coverage_fraction[record_mask]
+                self._target_round_log["term"][record_mask] = terminated[record_mask].float()  # any-time 85% (real success rate), not just ≤400 steps
+                self._target_round_log["rc"][record_mask] = rc_done_tensor[record_mask]
+                self._target_round_log["ep_reward"][record_mask] = ep_reward_done_tensor[record_mask]
 
-            if len(self._ep_buf["cov"]) >= 8:
-                cov  = self._ep_buf["cov"]
-                term = self._ep_buf["term"]
-                rc   = self._ep_buf["rc"]
-                ep_reward = self._ep_buf["ep_reward"]
+            if self._target_round_log["seen"].all():
                 log_dict = getattr(self, "_wandb_cache", {}).copy()
-                log_dict["episode_volume_fraction_mean"] = sum(cov) / len(cov)
-                log_dict["episode_volume_fraction_max"]  = max(cov)
-                log_dict["episode_terminated_frac"]      = sum(term) / len(term)
-                if rc:
-                    log_dict["rc_episode_sum_mean"] = sum(rc) / len(rc)
-                    log_dict["rc_episode_sum_max"]  = max(rc)
-                if ep_reward:
-                    log_dict["episode_reward_mean"] = sum(ep_reward) / len(ep_reward)
-                    log_dict["episode_reward_max"]  = max(ep_reward)
+                log_dict["episode_volume_fraction_mean"] = self._target_round_log["cov"].mean().item()
+                log_dict["episode_volume_fraction_max"]  = self._target_round_log["cov"].max().item()
+                log_dict["episode_terminated_frac"]      = self._target_round_log["term"].mean().item()
+                log_dict["rc_episode_sum_mean"] = self._target_round_log["rc"].mean().item()
+                log_dict["rc_episode_sum_max"]  = self._target_round_log["rc"].max().item()
+                log_dict["episode_reward_mean"] = self._target_round_log["ep_reward"].mean().item()
+                log_dict["episode_reward_max"]  = self._target_round_log["ep_reward"].max().item()
                 if hasattr(self, "target_total_voxels_list"):
                     log_dict["target_total_voxels"] = self.target_total_voxels_list[0]
                 wandb.log(log_dict)
-                self._ep_buf["cov"].clear()
-                self._ep_buf["term"].clear()
-                self._ep_buf["rc"].clear()
-                self._ep_buf["ep_reward"].clear()
+                self._reset_target_round_log()
 
         return terminated, time_outs
 
@@ -1542,15 +1758,34 @@ class roboticUSEnv(DirectRLEnv):
         self.frame_buffer[env_ids] = 0.0
         self.pose_buffer[env_ids] = 0.0
 
+        if hasattr(self, "target_bbox_list"):
+            if getattr(self, "_pending_sync_reset", False) and len(env_ids) == self.scene.num_envs:
+                # all envs arrived here via the proper done path — safe to randomize
+                self._pending_sync_reset = False
+                self._randomize_target(env_ids)
+            else:
+                if not hasattr(self, "_envs_reset_this_round"):
+                    self._envs_reset_this_round = set()
+                self._envs_reset_this_round.update(env_ids.tolist())
+                if len(self._envs_reset_this_round) >= self.scene.num_envs:
+                    self._envs_reset_this_round.clear()
+                    self._pending_sync_reset = True  # signal _get_dones to flush all envs next step
+
         if hasattr(self, "scanned_target_mask"):
             for i in range(len(self.scanned_target_mask)):
                 self.scanned_target_mask[i][env_ids] = False
+
+        if hasattr(self, "_prev_coords_per_type"):
+            self._prev_coords_per_type.clear()
 
         if hasattr(self, "rc_episode_sum"):
             self.rc_episode_sum[env_ids] = 0.0
 
         if hasattr(self, "reached_95"):
             self.reached_95[env_ids] = False
+
+        if hasattr(self, "_visited_step"):
+            self._visited_step[env_ids] = -(10**9)  # fresh sweep each episode (all cells rewardable)
 
         if hasattr(self, "episode_dist_sum"):
             self.episode_dist_sum[env_ids]   = 0.0

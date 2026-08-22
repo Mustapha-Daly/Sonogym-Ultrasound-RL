@@ -10,8 +10,8 @@ models:
     clip_actions: False # enforce limit for actions to avoid out of range exploration (e.g., due to high std)
     clip_log_std: True # to enforce log limits
     min_log_std: -3.0
-    max_log_std: 1.0
-    initial_log_std: -1.0 
+    max_log_std: 2.0 # was 1.0 2.0 matches paper
+    initial_log_std: 0.0 # was exp(-1.0) = 0.3679, so initial std = 0.3679, which was too conservative for exploration, so switched to  original 0.0 making std at init 1.0
     network:
       - name: features_extractor # shared CNN backbone to extract features from input states (e.g., images)
         input: STATES  # PyTorch NHWC -> NCHW 
@@ -58,30 +58,31 @@ memory:
 # https://skrl.readthedocs.io/en/latest/api/agents/ppo.html
 agent:
   class: PPO
-  rollouts: 720 # matches episode length 
-  learning_epochs: 4 # 720×4envs/6 = 480 samples/minibatch
-  mini_batches: 6 # 720×4envs/6 = 480 samples/minibatch
+  rollouts: 720 # must match episode length in sim which is 720 currently
+  learning_epochs: 4 # match paper exactly now: reuses the buffer 4 times, 720×4 envs/5 = 576 samples/epoch
+  mini_batches: 12 # buffer = 720 × 8 = 5760 samples was 48*5 epochs=240 gradient steps per rollout was too much for KlAdaptiver and crashed LR, changed to 12 to have only 48 gradient steps, tried 6 but did not work because of memory
   discount_factor: 0.99
   lambda: 0.95
-  learning_rate: 5.0e-05
-  learning_rate_scheduler: null
+  learning_rate: 1.0e-04 # same as paper
+  learning_rate_scheduler: KLAdaptiveLR #we put it back
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.016
-    max_lr: 2.0e-04
-    min_lr: 1.0e-06
+    kl_threshold: 0.02 # was 0.008 (paper) — raised because 48 grad steps/rollout accumulates KL > 0.016 consistently, crashing LR to min floor
+    max_lr: 4.0e-04
+    min_lr: 1.0e-05 #
   state_preprocessor: null
   state_preprocessor_kwargs: null
+
   value_preprocessor: RunningStandardScaler
   value_preprocessor_kwargs: null
   random_timesteps: 0
   learning_starts: 0
   grad_norm_clip: 1.0
-  ratio_clip: 0.1
+  ratio_clip: 0.2 # double what i had before, 0.1 was too small for this task, 0.2 is standard in PPO paper
   value_clip: 0.2
   clip_predicted_values: True
-  entropy_loss_scale: 0.0
-  value_loss_scale: 2.0
-  kl_threshold: 0.0
+  entropy_loss_scale: 0.001 # instead of 0.005 to encourage exploration
+  value_loss_scale: 1.0 # Set to 1.0 to match the PPO paper, was 2.0 but rewards are already big
+  kl_threshold: 0.016
   rewards_shaper_scale: 1.0
   time_limit_bootstrap: True 
   # logging and checkpoint
@@ -97,7 +98,7 @@ agent:
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 300000 
+  timesteps: 100000 
   environment_info: log
 probe:   #i added this part
   type: convex          # <<< KEY

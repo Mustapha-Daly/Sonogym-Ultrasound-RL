@@ -327,6 +327,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         device=device,
     )
 
+    # Log KL divergence passed to KLAdaptiveLR each rollout
+    if hasattr(agent, 'scheduler') and agent.scheduler is not None:
+        _orig_kl_step = agent.scheduler.step
+        def _kl_step(metrics=None):
+            if metrics is not None:
+                agent.track_data("Learning/KL divergence", float(metrics))
+            return _orig_kl_step(metrics)
+        agent.scheduler.step = _kl_step
+
     # resume training if checkpoint provided
     if args_cli.checkpoint:
         resume_path = retrieve_file_path(args_cli.checkpoint)
