@@ -1,5 +1,5 @@
 import nibabel as nib, numpy as np
-lm = nib.load("/home/yue/ws/sonogym/SonoGym/source/spinal_surgery/spinal_surgery/assets/data/HumanModels/selected_dataset_stl/s0030/combined_label_map.nii.gz").get_fdata()
+lm = nib.load("/home/yue/ws/sonogym/SonoGym/source/spinal_surgery/spinal_surgery/assets/data/HumanModels/selected_dataset_stl/s0004/combined_label_map.nii.gz").get_fdata()
 xz = (lm == 5).any(axis=1)            # collapse depth(Y) → (X,Z) liver footprint
 xs, zs = np.where(xz)
 print("liver X:", xs.min(), xs.max(), " Z:", zs.min(), zs.max())

@@ -4,9 +4,7 @@ robot:
   joint_pos: [1.5, -0.1, 0.0, -1.6, 0.0, 1.6, 0.0]
 
 patient:
-  pos: [0.35, 0.15, 0.6]
-  euler_yxz: [-90.0, 90.0, 0.0]
-  id_list: ['s0030']
+  id_list: ['s0004']  # change only this id; per-patient pose/ranges live in patient_profiles.yaml
   label_res: 0.0015 # m
   target_anatomy: 'liver'
 
@@ -31,7 +29,7 @@ observation:
   scale_net: 0.1
 action: 
   mode: 'continuous' # 'discrete', 'continuous'
-  scale: [2, 2, 0.1, 0.2] #instead of [2, 2, 0.25, 0.15] — angle & roll finer for stable orientation/coverage
+  scale: [3, 3, 0.5, 0.5] #instead of [2, 2, 0.25, 0.15] — angle & roll finer for stable orientation/coverage
   max_action: [4, 4, 0.2, 0.4] #instead of [4, 4, 0.2, 0.3]
 
 reward:
@@ -60,7 +58,7 @@ target_volume:
   #chose this range to avoid the liver edges and bones, and to avoid the liver being too close to the US probe at the start of the episode
 
 sim:
-  episode_length: 12 #ep_length in seconds → 12s × 60steps/s = 720 agent steps/episode
+  episode_length: 30 #ep_length in seconds → 12s × 60steps/s = 720 agent steps/episode
   patient_xz_range: [[131, 162, -1.5], [235, 279, 1.5]]  # liver bounds ±10 vox margin
   patient_xz_init_range: [[160, 232, 1.5], [160, 232, 1.5]]  # ± 10 vox init range
   #patient_xz_init_range: [[220, 162, -0.5], [235, 279, 0.5]]  #this is the range for randomized initial probe position, which is ± 20 voxels from the liver center. The liver center is at (x=203, z=168), so the range is x: 183–223, z: 148–188. This ensures that the probe starts within a reasonable distance from the liver and avoids starting too close to the edges of the liver or bones.

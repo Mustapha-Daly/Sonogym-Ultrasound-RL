@@ -86,6 +86,13 @@ import matplotlib.pyplot as plt
 scene_cfg = YAML().load(
     open(f"{PACKAGE_DIR}/tasks/robot_US_guidance/cfgs/robotic_US_guidance.yaml", "r")
 )
+scene_cfg["per_patient"] = YAML().load(
+    open(f"{PACKAGE_DIR}/tasks/robot_US_guidance/cfgs/patient_profiles.yaml", "r")
+)
+selected_patient_id = os.environ.get("SONOGYM_PATIENT_ID", "").strip()
+if selected_patient_id:
+    scene_cfg["patient"]["id_list"] = [selected_patient_id]
+
 # observation scale
 if (
     scene_cfg["observation"]["mode"] == "US"
@@ -136,13 +143,38 @@ elif scene_cfg["robot"]["type"] == "fr3":
 
 # patient
 patient_cfg = scene_cfg["patient"]
-quat = R.from_euler("yxz", patient_cfg["euler_yxz"], degrees=True).as_quat()
+if not patient_cfg.get("id_list"):
+    raise ValueError("patient.id_list must contain at least one patient id")
+primary_patient_id = patient_cfg["id_list"][0]
+
+
+def get_patient_param(patient_id, key, default=None):
+    """Per-patient config lookup: scene_cfg['per_patient'][patient_id][key], else `default`.
+    Lets each patient carry its own pos / liver ranges / center_voxel, so switching
+    id_list needs no other edits (omitted fields fall back to the globals)."""
+    return scene_cfg.get("per_patient", {}).get(patient_id, {}).get(key, default)
+
+
+scene_cfg["sim"]["patient_xz_range"] = get_patient_param(
+    primary_patient_id, "patient_xz_range", scene_cfg["sim"]["patient_xz_range"]
+)
+scene_cfg["sim"]["patient_xz_init_range"] = get_patient_param(
+    primary_patient_id,
+    "patient_xz_init_range",
+    scene_cfg["sim"]["patient_xz_init_range"],
+)
+_patient_euler = get_patient_param(
+    primary_patient_id, "euler_yxz", patient_cfg.get("euler_yxz", [-90.0, 90.0, 0.0])
+)
+quat = R.from_euler("yxz", _patient_euler, degrees=True).as_quat()
+# per-patient body placement (primary patient in id_list); falls back to global patient.pos
+_patient_pos = get_patient_param(primary_patient_id, "pos", patient_cfg.get("pos", [0.35, 0.15, 0.6]))
 INIT_STATE_HUMAN = RigidObjectCfg.InitialStateCfg(
     pos=(
-        float(patient_cfg["pos"][0]),
-        float(patient_cfg["pos"][1]),
-        float(patient_cfg["pos"][2]),
-    ),  # 0.7
+        float(_patient_pos[0]),
+        float(_patient_pos[1]),
+        float(_patient_pos[2]),
+    ),
     rot=(float(quat[3]), float(quat[0]), float(quat[1]), float(quat[2])),
 )
 
@@ -702,7 +734,6 @@ class roboticUSEnv(DirectRLEnv):
         if not target_cfg.get("enabled", False):
             return
 
-        cx, cy, cz = [int(v) for v in target_cfg["center_voxel"]]
         radius_mm = float(target_cfg["radius_mm"])
         radius_voxels = radius_mm / (self.US_slicer.label_res * 1000.0)
         target_label_id = int(target_cfg["label_id"])
@@ -714,6 +745,9 @@ class roboticUSEnv(DirectRLEnv):
         self.target_total_voxels_list = []
 
         for i in range(self.US_slicer.n_human_types):
+            # per-patient target center (falls back to the global center_voxel)
+            patient_id = patient_cfg["id_list"][i]
+            cx, cy, cz = [int(v) for v in get_patient_param(patient_id, "center_voxel", target_cfg["center_voxel"])]
             label_map = self.US_slicer.label_maps[i]
             X, Y, Z = label_map.shape
 
@@ -756,12 +790,6 @@ class roboticUSEnv(DirectRLEnv):
         radius_voxels = radius_mm / (self.US_slicer.label_res * 1000.0)
         target_label_id = int(target_cfg["label_id"])
         r_int = int(radius_voxels) + 1
-        margin = r_int + 1  # keep bbox fully inside volume at all times
-
-        x_lo, x_hi = target_cfg["liver_x_range"]
-        z_lo, z_hi = target_cfg["liver_z_range"]
-        cy = int(target_cfg["center_voxel"][1])  # Y (depth) stays fixed
-
         # sphere_mask is position-independent: only relative offsets from center matter
         offsets = torch.arange(-r_int, r_int + 1, device=self.sim.device)
         xs_rel = offsets.view(-1, 1, 1)
@@ -772,7 +800,14 @@ class roboticUSEnv(DirectRLEnv):
         min_target_voxels = int(0.99 * n_sphere)       # accept if ≥99% of sphere is liver (allows vessels)
 
         for i in range(self.US_slicer.n_human_types):
+            # per-patient liver bounds + depth (fall back to the global target_volume fields)
+            patient_id = patient_cfg["id_list"][i]
+            x_lo, x_hi = get_patient_param(patient_id, "liver_x_range", target_cfg["liver_x_range"])
+            z_lo, z_hi = get_patient_param(patient_id, "liver_z_range", target_cfg["liver_z_range"])
+            cy = int(get_patient_param(patient_id, "center_voxel", target_cfg["center_voxel"])[1])  # Y depth
             label_map = self.US_slicer.label_maps[i]
+            X, Y, Z = label_map.shape
+            cy = min(max(cy, r_int), Y - r_int - 1)  # keep sphere inside volume depth (avoids size mismatch)
 
             # restore old sphere voxels back to liver
             ox0, ox1, oy0, oy1, oz0, oz1 = self.target_bbox_list[i]
@@ -786,8 +821,11 @@ class roboticUSEnv(DirectRLEnv):
             x_min = x_max = y_min = y_max = z_min = z_max = 0
             cx = cz = 0
             for attempt in range(200):
-                cx = int(torch.randint(x_lo + margin, x_hi - margin + 1, (1,)).item())
-                cz = int(torch.randint(z_lo + margin, z_hi - margin + 1, (1,)).item())
+                # liver_x_range / liver_z_range are already the patient-specific safe center ranges
+                cx = int(torch.randint(x_lo, x_hi + 1, (1,)).item())
+                cz = int(torch.randint(z_lo, z_hi + 1, (1,)).item())
+                cx = min(max(cx, r_int), X - r_int - 1)  # keep sphere inside volume (avoids size mismatch)
+                cz = min(max(cz, r_int), Z - r_int - 1)
 
                 x_min, x_max = cx - r_int, cx + r_int + 1
                 y_min, y_max = cy - r_int, cy + r_int + 1
@@ -968,7 +1006,8 @@ class roboticUSEnv(DirectRLEnv):
 
         n_s = int(scanned.sum())
         n_t = len(scanned)
-        ax.set_title(f"Coverage  {n_s}/{n_t} = {n_s / n_t * 100:.1f}%")
+        pct = (n_s / n_t * 100.0) if n_t > 0 else 0.0   # guard: n_t=0 when target not placed (wrong per-patient ranges)
+        ax.set_title(f"Coverage  {n_s}/{n_t} = {pct:.1f}%")
         ax.set_xlabel("X vox")
         ax.set_ylabel("Z vox")
         ax.set_zlabel("Y (depth)")
@@ -1256,7 +1295,7 @@ class roboticUSEnv(DirectRLEnv):
                 if hasattr(self, "target_bbox_list"):
                     self._update_voxel_viz()
 
-                VIZ_EVERY = 1  # was 10; 1 = matplotlib in lock-step with the probe (slower). Try 2-3 if too slow.
+                VIZ_EVERY = 10 # was 10; 1 = matplotlib in lock-step with the probe (slower). Try 2-3 if too slow.
                 if self._viz_step % VIZ_EVERY == 0:
                     # pick env 0 for plotting
                     label2d = label_hw[0]  # (H,W)
@@ -1327,6 +1366,10 @@ class roboticUSEnv(DirectRLEnv):
             # in _get_observations:
             x_cmd = self.US_slicer.current_x_z_x_angle_cmd[0, 0].int()
             z_cmd = self.US_slicer.current_x_z_x_angle_cmd[0, 1].int()
+            max_x = self.US_slicer.surface_normal_list[0].shape[0] - 1
+            max_z = self.US_slicer.surface_normal_list[0].shape[1] - 1
+            x_cmd = x_cmd.clamp(0, max_x)
+            z_cmd = z_cmd.clamp(0, max_z)
             normal_human = self.US_slicer.surface_normal_list[0][x_cmd, z_cmd]
 
             
@@ -1337,6 +1380,8 @@ class roboticUSEnv(DirectRLEnv):
             vec_robot_to_patient = patient_pos - robot_pos
             x_cmd = self.US_slicer.current_x_z_x_angle_cmd[0, 0].int()
             z_cmd = self.US_slicer.current_x_z_x_angle_cmd[0, 1].int()
+            x_cmd = x_cmd.clamp(0, max_x)
+            z_cmd = z_cmd.clamp(0, max_z)
             normal_human = self.US_slicer.surface_normal_list[0][x_cmd, z_cmd]
 
         return observations

@@ -40,6 +40,7 @@ parser.add_argument(
 )
 parser.add_argument("--num_envs", type=int, default=2, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default='Isaac-robot-US-guided-surgery-v0', help="Name of the task.")
+parser.add_argument("--patient_id", type=str, default=None, help="Override patient.id_list[0] from YAML")
 parser.add_argument("--checkpoint", type=str, default='/home/yunkao/git/IsaacLabExtensionTemplate/logs/experiments/us-guided-surgery/single/model-based-sim/PPO/2025-04-25_18-39-42_ppo_torch_PPO_default_US_net/checkpoints/best_agent.pt', help="Path to model checkpoint.")
 parser.add_argument(
     "--use_pretrained_checkpoint",
@@ -82,6 +83,9 @@ import os
 import time
 import torch
 import cProfile
+
+if args_cli.patient_id:
+    os.environ["SONOGYM_PATIENT_ID"] = args_cli.patient_id
 
 import skrl
 from packaging import version
