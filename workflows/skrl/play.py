@@ -11,11 +11,11 @@ cd ~/IsaacLab
 PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH \
   ./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/skrl/play.py \
   --task Isaac-robot-US-guidance-v0 \
-  --checkpoint ~/IsaacLab/logs/skrl/US_guidance/2026-07-10_06-19-54_ppo_torch_PPO_US/checkpoints/best_agent.pt \
+  --checkpoint ~/IsaacLab/logs/skrl/US_guidance/2026-08-15_13-45-36_ppo_torch_PPO_US/ccheckpoints/best_agent.pt \
   --num_envs 1 \
-  --enable_cameras
-"""
-
+  --enable_cameras \
+  --noise_k 0.0
+"""    
 # ~/IsaacLab/logs/skrl/US_guidance/2026-07-11_17-41-50_ppo_torch_PPO_US/checkpoints/best_agent.pt \
 
 """
@@ -40,6 +40,7 @@ parser.add_argument(
 )
 parser.add_argument("--num_envs", type=int, default=2, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default='Isaac-robot-US-guided-surgery-v0', help="Name of the task.")
+parser.add_argument("--patient_id", type=str, default=None, help="Override patient.id_list[0] from YAML")
 parser.add_argument("--checkpoint", type=str, default='/home/yunkao/git/IsaacLabExtensionTemplate/logs/experiments/us-guided-surgery/single/model-based-sim/PPO/2025-04-25_18-39-42_ppo_torch_PPO_default_US_net/checkpoints/best_agent.pt', help="Path to model checkpoint.")
 parser.add_argument(
     "--use_pretrained_checkpoint",
@@ -61,6 +62,8 @@ parser.add_argument(
     help="The RL algorithm used for training the skrl agent.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument("--num_steps", type=int, default=0, help="Stop after this many steps (0 = run forever).")
+parser.add_argument("--noise_k", type=float, default=1.0, help="Noise blend: action = mean + k*(sample-mean). 0=deterministic (pure mean), 1=full stochastic.")
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -80,6 +83,9 @@ import os
 import time
 import torch
 import cProfile
+
+if args_cli.patient_id:
+    os.environ["SONOGYM_PATIENT_ID"] = args_cli.patient_id
 
 import skrl
 from packaging import version
@@ -177,7 +183,10 @@ def main():
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     # init wandb
-    wandb.init(project=args_cli.task, config=env_cfg)
+    #wandb.init(project=args_cli.task, config=env_cfg)
+
+    # handle to the raw IsaacLab env (for probe-pose printing in the loop below)
+    _raw_env = env.unwrapped
 
     # wrap around environment for skrl
     env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)  # same as: `wrap_env(env, wrapper="auto")`
@@ -199,6 +208,7 @@ def main():
     if ppo_cfg.get("value_preprocessor") == "RunningStandardScaler":
         ppo_cfg["value_preprocessor"] = RunningStandardScaler
         ppo_cfg["value_preprocessor_kwargs"] = {"size": 1}
+    ppo_cfg["learning_rate_scheduler"] = None  # scheduler not needed in eval mode
     ppo_cfg["experiment"]["write_interval"] = 0
     ppo_cfg["experiment"]["checkpoint_interval"] = 0
 
@@ -225,16 +235,42 @@ def main():
             # - multi-agent (deterministic) actions
             if hasattr(env, "possible_agents"):
                 actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in env.possible_agents}
-            # - single-agent (deterministic) actions
+            # - single-agent actions
             else:
-                actions = outputs[-1].get("mean_actions", outputs[0])
+                # noise-blend: action = mean + k*(sample - mean)
+                #   --noise_k 0.0  → deterministic (pure mean, tests μ alone)
+                #   --noise_k 1.0  → full stochastic (mean + full noise)
+                # Sweep k = 0, 0.25, 0.5, 1.0 to see if search relies on noise (luck)
+                # or holds at low k (skill).
+                mean = outputs[-1].get("mean_actions", outputs[0])
+                sample = outputs[0]
+                actions = mean + args_cli.noise_k * (sample - mean)
             # env stepping
             obs, _, _, _, _ = env.step(actions)
+        timestep += 1
+
+        # Print the probe 4-DoF pose every 10 steps so we can see whether the
+        # policy is actually searching or just repeating a fixed sweep.
+        if timestep % 50 == 0:
+            try:
+                cmd = _raw_env.US_slicer.current_x_z_x_angle_cmd[0]
+                roll = _raw_env.US_slicer.roll_adj[0, 0]
+                print(
+                    f"[POSE {timestep}] "
+                    f"x={cmd[0].item():.1f} "
+                    f"z={cmd[1].item():.1f} "
+                    f"angle={cmd[2].item():.3f} "
+                    f"roll={roll.item():.3f}"
+                )
+            except Exception:
+                pass
+
         if args_cli.video:
-            timestep += 1
             # exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break
+        if args_cli.num_steps > 0 and timestep >= args_cli.num_steps:
+            break
 
         # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)
