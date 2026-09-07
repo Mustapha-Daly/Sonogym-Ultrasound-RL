@@ -1,0 +1,92 @@
+s0030:
+  pos: [0.35, 0.15, 0.60]
+  euler_yxz: [-90.0, 90.0, 0.0]
+  center_voxel: [206, 175, 238]
+  liver_x_range: [131, 235]
+  liver_z_range: [162, 279]
+  patient_xz_range: [[131, 162, -1.5], [235, 279, 1.5]]
+  patient_xz_init_range: [[160, 232, 1.5], [160, 232, 1.5]]
+
+s0004:
+  pos: [0.45, 0.1, 0.65]
+  euler_yxz: [-90.0, 90.0, 0.0]
+  center_voxel: [148, 91, 274]
+  liver_x_range: [47,197]
+  liver_z_range: [208,321]
+  patient_xz_range: [[47, 208, -1.5], [197, 321, 1.5]] # at least15% of the liver is visible in this range
+  patient_xz_init_range: [[87, 253, 1.5], [87, 253, 1.5]]
+
+s0006: #needs to be tuned
+  pos: [0.2, 0.0, 0.65]
+  euler_yxz: [-90.0, 90.0, 0.0]
+  center_voxel: [149, 140, 195]
+  liver_x_range: [62,192]
+  liver_z_range: [141,280]
+  patient_xz_range: [[60,141, -1.5], [192,280, 1.5]] # at least15% of the liver is visible in this range
+  patient_xz_init_range: [[87, 180, 1.5], [87, 180, 1.5]]
+
+s0010:
+  pos: [0.2, 0.1, 0.65]
+  euler_yxz: [-90.0, 90.0, 0.0]
+  center_voxel: [186, 150, 220]
+  liver_x_range: [117,228]
+  liver_z_range: [167,262]
+  patient_xz_range: [[110,140, -1.5], [240,280, 1.5]] # at least15% of the liver is visible in this range
+  patient_xz_init_range: [[130, 200, 1.5], [130, 200, 1.5]]
+
+s0012: # robot movements are weird on this patient
+  pos: [0.4, 0.1, 0.75]
+  euler_yxz: [-90.0, 90.0, 0.0]
+  center_voxel: [163, 95, 240]
+  liver_x_range: [81,210]
+  liver_z_range: [173,297]
+  patient_xz_range: [[68,170, -1.5], [210,300, 1.5]] # at least15% of the liver is visible in this range
+  patient_xz_init_range: [[124, 237, 1.5], [124, 237, 1.5]]
+
+#s0014:
+  #pos: [0.4, 0.1, 0.65] euler_yxz: [-90.0, 90.0, 0.0] center_voxel: [197, 127, 253] liver_x_range: [143,239] liver_z_range: [212,291] patient_xz_range: [[125,200, -1.5], [250,300, 1.5]]  patient_xz_init_range: [[130, 200, 1.5], [130, 200, 1.5]]
+
+s0015:
+  pos: [0.4, 0.1, 0.65]
+  euler_yxz: [-90.0, 90.0, 0.0]
+  center_voxel: [186, 150, 220]
+  liver_x_range: [105,236]
+  liver_z_range: [178,316]
+  patient_xz_range: [[88,150, -1.5], [240,320, 1.5]] 
+  patient_xz_init_range: [[113, 230, 1.5], [113, 230, 1.5]]
+
+s0024:
+  pos: [0.4, 0.1, 0.65]
+  euler_yxz: [-90.0, 90.0, 0.0]
+  center_voxel: [197, 182, 294]
+  liver_x_range: [105,248]
+  liver_z_range: [226,331]
+  patient_xz_range: [[100,220, -1.5], [250,340, 1.5]] 
+  patient_xz_init_range: [[113, 280, 1.5], [113, 280, 1.5]]
+
+s0028:
+  pos: [0.4, 0.1, 0.65]
+  euler_yxz: [-90.0, 90.0, 0.0]
+  center_voxel: [189, 160, 231]
+  liver_x_range: [142,230]
+  liver_z_range: [187,268]
+  patient_xz_range: [[78,175, -1.5], [235,280, 1.5]] 
+  patient_xz_init_range: [[130, 250, 1.5], [130, 250, 1.5]]
+
+s0029:
+  pos: [0.4, 0.1, 0.65]
+  euler_yxz: [-90.0, 90.0, 0.0]
+  center_voxel: [165, 176, 243]
+  liver_x_range: [79,231]
+  liver_z_range: [220,270]
+  patient_xz_range: [[70,204, -1.5], [240,275, 1.5]] 
+  patient_xz_init_range: [[130, 250, 1.5], [130, 250, 1.5]]
+
+s0038:
+  pos: [0.4, 0.1, 0.65]
+  euler_yxz: [-90.0, 90.0, 0.0]
+  center_voxel:  [155, 143, 269]
+  liver_x_range: [75,204]
+  liver_z_range: [217,308]
+  patient_xz_range: [[54,189, -1.5], [210,315, 1.5]] 
+  patient_xz_init_range: [[130, 250, 1.5], [130, 250, 1.5]]
