@@ -8,6 +8,7 @@ Script to train RL agent with skrl.
 """
 # PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH ./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/skrl/train.py --task Isaac-robot-US-guidance-v0 --num_envs 8 --headless --enable_cameras
 #  CUDA_LAUNCH_BLOCKING=1 PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH ./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/skrl/train.py --task Isaac-robot-US-guidance-v0 --num_envs 8 --headless --enable_cameras
+#tensorboard --logdir logs/skrl/US_guidance
 
 # -----------------------------------------------------------------------------
 # Launch Isaac Sim first
@@ -34,6 +35,7 @@ parser.add_argument("--video_length", type=int, default=200, help="Length of the
 parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
 parser.add_argument("--num_envs", type=int, default=64, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default="Isaac-robot-US-guidance-v0", help="Name of the task.")
+parser.add_argument("--patient_id", type=str, default=None, help="Override patient.id_list[0] from YAML")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes.")
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint to resume training.")
@@ -58,6 +60,8 @@ AppLauncher.add_app_launcher_args(parser)
 
 # parse args (keep hydra args)
 args_cli, hydra_args = parser.parse_known_args()
+if args_cli.patient_id:
+    os.environ["SONOGYM_PATIENT_ID"] = args_cli.patient_id
 
 # always enable cameras to record video
 if args_cli.video:

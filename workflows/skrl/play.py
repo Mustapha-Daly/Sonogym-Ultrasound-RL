@@ -11,8 +11,8 @@ cd ~/IsaacLab
 PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH \
   ./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/skrl/play.py \
   --task Isaac-robot-US-guidance-v0 \
-  --checkpoint ~/IsaacLab/logs/skrl/US_guidance/2026-08-15_13-45-36_ppo_torch_PPO_US/ccheckpoints/best_agent.pt \
-  --num_envs 1 \
+  --checkpoint ~/IsaacLab/logs/skrl/US_guidance/2026-09-06_18-29-47_ppo_torch_PPO_US/checkpoints/best_agent.pt \
+  --num_envs 10 \
   --enable_cameras \
   --noise_k 0.0
 """    
@@ -40,6 +40,7 @@ parser.add_argument(
 )
 parser.add_argument("--num_envs", type=int, default=2, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default='Isaac-robot-US-guided-surgery-v0', help="Name of the task.")
+parser.add_argument("--patient_id", type=str, default=None, help="Override patient.id_list[0] from YAML")
 parser.add_argument("--checkpoint", type=str, default='/home/yunkao/git/IsaacLabExtensionTemplate/logs/experiments/us-guided-surgery/single/model-based-sim/PPO/2025-04-25_18-39-42_ppo_torch_PPO_default_US_net/checkpoints/best_agent.pt', help="Path to model checkpoint.")
 parser.add_argument(
     "--use_pretrained_checkpoint",
@@ -82,6 +83,9 @@ import os
 import time
 import torch
 import cProfile
+
+if args_cli.patient_id:
+    os.environ["SONOGYM_PATIENT_ID"] = args_cli.patient_id
 
 import skrl
 from packaging import version
@@ -178,8 +182,15 @@ def main():
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
-    # init wandb
-    #wandb.init(project=args_cli.task, config=env_cfg)
+    # init wandb — separate "-inference" project so eval runs don't clutter the training
+    # project view. This is enough by itself to activate the per-patient coverage/success
+    # logging that already lives in the env's _get_dones() (it's gated on wandb.run being
+    # non-None) — episode_volume_fraction/<patient>, target_depth/<patient>,
+    # episode_terminated_frac, episode_success_count, etc. all start firing for free.
+    wandb.init(
+        project=f"{args_cli.task}-inference",
+        config={"checkpoint": resume_path, "num_envs": args_cli.num_envs, "noise_k": args_cli.noise_k},
+    )
 
     # handle to the raw IsaacLab env (for probe-pose printing in the loop below)
     _raw_env = env.unwrapped
@@ -247,6 +258,7 @@ def main():
 
         # Print the probe 4-DoF pose every 10 steps so we can see whether the
         # policy is actually searching or just repeating a fixed sweep.
+        # NOTE: this pose is env 0 only (s0030) — it does not represent all envs.
         if timestep % 50 == 0:
             try:
                 cmd = _raw_env.US_slicer.current_x_z_x_angle_cmd[0]
@@ -258,6 +270,15 @@ def main():
                     f"angle={cmd[2].item():.3f} "
                     f"roll={roll.item():.3f}"
                 )
+            except Exception:
+                pass
+            # Per-env progress snapshot (all envs, not just env 0) — makes it visible
+            # whether envs that haven't printed [EPISODE END] yet are actually
+            # progressing (episode_length_buf ticking up normally, will time out by
+            # ~720) versus genuinely stuck. env i always runs patient id_list[i].
+            try:
+                ep_len = _raw_env.episode_length_buf.tolist()
+                print(f"[PROGRESS {timestep}] episode_length_buf per env: {ep_len}")
             except Exception:
                 pass
 
@@ -272,6 +293,19 @@ def main():
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
+
+    # final exact run-wide summary (mean over every episode that actually completed
+    # during this play session, not just the last round's snapshot) — same pattern
+    # train.py uses at the end of training, via the same env method
+    if wandb.run is not None:
+        run_summary = _raw_env.get_run_metric_summary()
+        if run_summary:
+            wandb.run.summary["run_episode_volume_fraction_mean"] = run_summary["run_episode_volume_fraction_mean"]
+            wandb.run.summary["run_episode_terminated_mean"] = run_summary["run_episode_terminated_mean"]
+            wandb.run.summary["run_episode_reward_mean"] = run_summary["run_episode_reward_mean"]
+            wandb.run.summary["run_completed_episodes"] = int(run_summary["run_completed_episodes"])
+            print(f"[INFO] Inference run summary: {run_summary}")
+        wandb.finish()
 
     # close the simulator
     env.close()

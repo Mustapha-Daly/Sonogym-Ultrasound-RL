@@ -19,9 +19,12 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description="Keyboard teleoperation (US guidance)")
 parser.add_argument("--task", type=str, default="Isaac-robot-US-guidance-v0")
 parser.add_argument("--num_envs", type=int, default=8)
+parser.add_argument("--patient_id", type=str, default=None, help="Override patient.id_list[0] from YAML")
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+if args_cli.patient_id:
+    os.environ["SONOGYM_PATIENT_ID"] = args_cli.patient_id
 
 # -----------------------------------------------------------f-l-----------------
 # Launch Isaac Sim FIRST
@@ -129,7 +132,7 @@ def main():
             env.step(actions)
             step_count += 1
 
-            if step_count % 50 == 0 and hasattr(raw_env, "US_slicer"):
+            if step_count % 20 == 0 and hasattr(raw_env, "US_slicer"):
                 print(
                     f"[POSE {step_count}] "
                     f"x={raw_env.US_slicer.current_x_z_x_angle_cmd[0, 0].item():.1f} "
