@@ -8,6 +8,7 @@ Script to train RL agent with skrl.
 """
 # PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH ./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/skrl/train.py --task Isaac-robot-US-guidance-v0 --num_envs 8 --headless --enable_cameras
 #  CUDA_LAUNCH_BLOCKING=1 PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH ./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/skrl/train.py --task Isaac-robot-US-guidance-v0 --num_envs 8 --headless --enable_cameras
+#tensorboard --logdir logs/skrl/US_guidance
 
 # -----------------------------------------------------------------------------
 # Launch Isaac Sim first

@@ -155,14 +155,9 @@ def get_patient_param(patient_id, key, default=None):
     return scene_cfg.get("per_patient", {}).get(patient_id, {}).get(key, default)
 
 
-scene_cfg["sim"]["patient_xz_range"] = get_patient_param(
-    primary_patient_id, "patient_xz_range", scene_cfg["sim"]["patient_xz_range"]
-)
-scene_cfg["sim"]["patient_xz_init_range"] = get_patient_param(
-    primary_patient_id,
-    "patient_xz_init_range",
-    scene_cfg["sim"]["patient_xz_init_range"],
-)
+# DO NOT set globally for single patient — per-env wiring in __init__ handles this for all patients
+# scene_cfg["sim"]["patient_xz_range"] = get_patient_param(...)
+# scene_cfg["sim"]["patient_xz_init_range"] = get_patient_param(...)
 _patient_euler = get_patient_param(
     primary_patient_id, "euler_yxz", patient_cfg.get("euler_yxz", [-90.0, 90.0, 0.0])
 )
@@ -260,7 +255,7 @@ class roboticUSEnvCfg(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=8, env_spacing=4.0, replicate_physics=False   #I have changed the number of env from 100 to 8
+        num_envs=10, env_spacing=4.0, replicate_physics=False   # 10 patients, 1 env per patient (s0030, s0004, ..., s0038)
     )
 
 
@@ -382,20 +377,21 @@ class roboticUSEnv(DirectRLEnv):
             open(f"{PACKAGE_DIR}/lab/sensors/cfgs/us_generative_cfg.yaml", "r")
         )
         self.sim_cfg = scene_cfg["sim"]
-        self.init_cmd_pose_min = (
-            torch.tensor(
-                self.sim_cfg["patient_xz_init_range"][0], device=self.sim.device
-            )
-            .reshape((1, -1))
-            .repeat(self.scene.num_envs, 1)
-        )
-        self.init_cmd_pose_max = (
-            torch.tensor(
-                self.sim_cfg["patient_xz_init_range"][1], device=self.sim.device
-            )
-            .reshape((1, -1))
-            .repeat(self.scene.num_envs, 1)
-        )
+        # PER-ENV init ranges — one per patient
+        n_envs = self.scene.num_envs
+        n_patients = len(patient_cfg["id_list"])
+        self.init_cmd_pose_min = torch.zeros((n_envs, 3), device=self.sim.device)
+        self.init_cmd_pose_max = torch.zeros((n_envs, 3), device=self.sim.device)
+
+        for i, patient_id in enumerate(patient_cfg["id_list"]):
+            init_range = get_patient_param(patient_id, "patient_xz_init_range", self.sim_cfg["patient_xz_init_range"])
+            min_val = torch.tensor(init_range[0], device=self.sim.device)
+            max_val = torch.tensor(init_range[1], device=self.sim.device)
+            # Assign to all envs using this patient: env_idx % n_patients == i
+            for env_idx in range(n_envs):
+                if env_idx % n_patients == i:
+                    self.init_cmd_pose_min[env_idx] = min_val
+                    self.init_cmd_pose_max[env_idx] = max_val
         if scene_cfg["observation"]["3D"]:
             img_thickness = us_cfg["image_3D_thickness"]
         else:
@@ -419,6 +415,34 @@ class roboticUSEnv(DirectRLEnv):
             us_generative_cfg=us_generative_cfg,
             allocate_us_random_maps=scene_cfg["observation"]["mode"] == "US",
         )
+        # PER-ENV physical x/z/angle clamp — USSlicer.update_cmd() clamps every probe
+        # command to a single global self.x_z_range (was built from patient_xz_range,
+        # i.e. patient #0/s0030's box only). With 10 different patients that silently
+        # capped the probe into s0030's box on every other env, making most of those
+        # patients' liver/target areas physically unreachable.
+        # Patch update_cmd itself (not self.x_z_range) with a per-env [min,max] clamp:
+        # x_z_range is also read by construct_T_maps/construct_Vl_maps (US_slicer.py),
+        # which assume its old (2,3) shape — dormant today (only runs when
+        # observation.mode=="US"; current cfg is "seg") but reshaping x_z_range in
+        # place would silently break them the day that mode is turned on. Overriding
+        # only this instance's update_cmd leaves x_z_range itself untouched.
+        n_patients = len(patient_cfg["id_list"])
+        _xz_min = torch.zeros((self.scene.num_envs, 3), device=self.sim.device)
+        _xz_max = torch.zeros((self.scene.num_envs, 3), device=self.sim.device)
+        for i, patient_id in enumerate(patient_cfg["id_list"]):
+            xz_range = get_patient_param(patient_id, "patient_xz_range", self.sim_cfg["patient_xz_range"])
+            min_val = torch.tensor(xz_range[0], device=self.sim.device)
+            max_val = torch.tensor(xz_range[1], device=self.sim.device)
+            for env_idx in range(self.scene.num_envs):
+                if env_idx % n_patients == i:
+                    _xz_min[env_idx] = min_val
+                    _xz_max[env_idx] = max_val
+
+        def _update_cmd_per_env(d_x_z_x_angle, _slicer=self.US_slicer, _min=_xz_min, _max=_xz_max):
+            _slicer.current_x_z_x_angle_cmd += d_x_z_x_angle
+            _slicer.current_x_z_x_angle_cmd = torch.clamp(_slicer.current_x_z_x_angle_cmd, _min, _max)
+
+        self.US_slicer.update_cmd = _update_cmd_per_env
         self._inject_target_volume()
         self.coronal_x_angle_rad = float(
             scene_cfg["motion_planning"].get("coronal_x_angle_rad", 0.5 * np.pi)
@@ -530,16 +554,29 @@ class roboticUSEnv(DirectRLEnv):
             device=self.sim.device
         )
 
-        # normalization ranges [0, 1]
-        xz_range = self.sim_cfg["patient_xz_range"]
-        self.pose_norm_min = torch.tensor(
-            [xz_range[0][0], xz_range[0][1], -3.14, -self.max_roll_adj],
-            device=self.sim.device
-        )
-        self.pose_norm_max = torch.tensor(
-            [xz_range[1][0], xz_range[1][1],  3.14,  self.max_roll_adj],
-            device=self.sim.device
-        )
+        # PER-ENV normalization ranges [0, 1] — one per patient
+        # env i uses patient i % n_human_types, so build tensors for all patients
+        n_envs = self.scene.num_envs
+        n_patients = len(patient_cfg["id_list"])
+
+        self.pose_norm_min_per_env = torch.zeros((n_envs, 4), device=self.sim.device)
+        self.pose_norm_max_per_env = torch.zeros((n_envs, 4), device=self.sim.device)
+
+        for i, patient_id in enumerate(patient_cfg["id_list"]):
+            xz_range = get_patient_param(patient_id, "patient_xz_range", self.sim_cfg["patient_xz_range"])
+            pose_min = torch.tensor(
+                [xz_range[0][0], xz_range[0][1], -3.14, -self.max_roll_adj],
+                device=self.sim.device
+            )
+            pose_max = torch.tensor(
+                [xz_range[1][0], xz_range[1][1],  3.14,  self.max_roll_adj],
+                device=self.sim.device
+            )
+            # Assign to all envs that use this patient: env i uses patient i % n_patients
+            for env_idx in range(n_envs):
+                if env_idx % n_patients == i:
+                    self.pose_norm_min_per_env[env_idx] = pose_min
+                    self.pose_norm_max_per_env[env_idx] = pose_max
 
         self._img_W, self._img_H = us_cfg["image_size"]
 
@@ -610,6 +647,36 @@ class roboticUSEnv(DirectRLEnv):
         )
         medical_bed = RigidObject(medical_bed_cfg)
 
+        # Clone Robot_US/Bed (identical across every env — safe and correct to
+        # replicate from env_0) BEFORE spawning Human. copy_from_source=False is fine
+        # here (fast path, lightweight inherit) since Robot_US/Bed really are meant to
+        # be identical everywhere.
+        #
+        # Human is spawned AFTER clone_environments() on purpose — this used to run
+        # BEFORE it, and that was the actual root cause of "every env shows the same
+        # patient": Cloner.clone()'s source_prim_path is /World/envs/env_0, the WHOLE
+        # env container, not just its Human child. Whichever copy_from_source value is
+        # used, that call re-touches env_0's *entire* subtree onto every other env
+        # afterward (Sdf.CopySpec full overwrite when True; an inherits arc — which
+        # outranks references in USD composition strength — when False). Either way it
+        # clobbered the per-patient MultiUsdFileCfg spawn that had already put a
+        # DIFFERENT patient under each env's own Human prim. Confirmed empirically:
+        # swapping which patient is id_list[0] made every env follow it. Spawning
+        # Human after clone_environments() means there's no later clone call left to
+        # overwrite/inherit over it — MultiUsdFileCfg's own regex-matched per-env spawn
+        # (usd_file_list[index % len(usd_file_list)]) is the last and only word for
+        # that specific prim.
+        # copy_from_source=True: confirmed via Isaac Sim's own cloner test suite
+        # (test_grid_cloner_inherit_addition vs test_grid_cloner_copy_addition) that
+        # copy_from_source=False's "inherits" arc is LIVE — env_1 dynamically picks up
+        # anything added to env_0 later, regardless of when, which is exactly why
+        # reordering alone (Human spawned after this call) didn't fix it: env_1 kept
+        # inheriting whatever showed up under env_0/Human afterward. copy_from_source=
+        # True is a static snapshot at the moment this line runs — Human doesn't exist
+        # on ANY env yet at this point (spawned below, after this call), so there is
+        # nothing Human-related to snapshot/propagate here at all.
+        self.scene.clone_environments(copy_from_source=True)
+
         # human:
         human_cfg = RigidObjectCfg(
             prim_path="/World/envs/env_.*/Human",
@@ -638,8 +705,7 @@ class roboticUSEnv(DirectRLEnv):
             init_state=INIT_STATE_HUMAN,
         )
         self.human = RigidObject(human_cfg)
-        # assign members
-        self.scene.clone_environments(copy_from_source=False)
+
         # add articulation to scene
         self.scene.articulations["robot_US"] = self.robot
         self.scene.rigid_objects["human"] = self.human
@@ -697,8 +763,11 @@ class roboticUSEnv(DirectRLEnv):
     
     #Added: Pose Normalization helper
     def _normalize_pose(self, pose: torch.Tensor) -> torch.Tensor:
-        return (pose - self.pose_norm_min) / (
-            self.pose_norm_max - self.pose_norm_min + 1e-6
+        """Normalize pose [x, z, angle, roll] using per-env patient ranges.
+        pose: (N, 4), where N = num_envs
+        """
+        return (pose - self.pose_norm_min_per_env) / (
+            self.pose_norm_max_per_env - self.pose_norm_min_per_env + 1e-6
         )
 
     def _apply_superficial_bone_shadow(self, label_hw: torch.Tensor) -> torch.Tensor:
@@ -725,6 +794,74 @@ class roboticUSEnv(DirectRLEnv):
         shadowed[shadow] = 0
         return shadowed
 
+    def _construct_target_valid_xyz(self, patient_id, human_stl_dir, label_map, kernel, n_sphere, r_int,
+                                     skin_y_array, max_visible_depth_voxels, radius_voxels):
+        """Precompute every (cx, cy, cz) — x, z, AND depth, all three free — where a target
+        sphere
+
+        (a) fits the liver with >=99% coverage — same tolerance _randomize_target used
+        to check one random guess at a time, NOT a strict 100%-pure erosion (verified offline
+        against this project's own logged targets: a strict version rejects spots the old
+        200-attempt loop already found and used successfully — livers have vessels),
+        (b) sits within the probe's actual visible imaging depth from the skin AT THAT (x,z),
+        with a radius_voxels margin subtracted so the WHOLE sphere stays within the nominal
+        depth budget, not just its center — a center placed right at max_visible_depth_voxels
+        would have its deepest surface point radius_voxels further down, past the nominal
+        imaging depth. This is now the ONLY depth restriction — full liver depth is allowed.
+        (Was previously also capped to the shallow half [mean_y, skin]; removed per
+        supervisor's actual spec — depth should vary across the whole reachable liver, capped
+        only by probe visibility, not artificially confined to the shallow half.)
+        """
+
+   
+        # extra margin beyond the physically-derived (100 nominal - radius) figure: this
+        # check only reasons about straight-line distance from skin along Y, but the real
+        # probe can be tilted/rolled, so the actual sampled depth at extreme poses can
+        # differ from this straight-line estimate. Not correcting a direction bug — the
+        # skin/deep axis convention itself is verified correct (see construct_highest_y_array
+        # and the visible-mask discussion) — this is purely a precautionary buffer against
+        # the pose-tilt approximation.
+        pose_tilt_margin_voxels = scene_cfg.get("target_volume", {}).get("pose_tilt_margin_voxels", 0)
+        effective_max_depth_voxels = max_visible_depth_voxels - radius_voxels - pose_tilt_margin_voxels
+        cache_path = f"{human_stl_dir}/target_erosion_xyz_r{r_int}_depth{int(round(effective_max_depth_voxels))}.pt"
+        if os.path.exists(cache_path):
+            return torch.load(cache_path, map_location=self.sim.device)
+
+        from scipy.signal import fftconvolve 
+        liver_np = (label_map.detach().cpu().numpy() == self.cfg.LIVER_LABEL_ID).astype(np.float32)
+        kernel_np = kernel.detach().cpu().numpy().astype(np.float32)
+        liver_fraction = fftconvolve(liver_np, kernel_np, mode="same") / n_sphere
+        fits_liver = liver_fraction >= 0.99                                # (X, Y, Z) bool, full volume
+
+        X, Y, Z = label_map.shape
+        y_idx = np.arange(Y).reshape(1, Y, 1)
+
+        skin_y_np = skin_y_array.detach().cpu().numpy()                    # (X, Z)
+        visible = (skin_y_np[:, None, :] - y_idx) <= effective_max_depth_voxels   # (X, Y, Z) bool
+
+        valid_xyz_np = fits_liver & visible
+        coords = torch.from_numpy(np.argwhere(valid_xyz_np)).to(device=self.sim.device, dtype=torch.long)  # (N,3)
+
+        y_span = f"y in [{coords[:,1].min().item()},{coords[:,1].max().item()}]" if coords.shape[0] > 0 else "empty"
+        if coords.shape[0] > 0:
+            # depth-from-skin (not raw y) for every valid center, for curriculum-cutoff
+            # decisions: how much of this patient's valid target pool survives at
+            # progressively shallower depth caps.
+            coords_np = coords.cpu().numpy()
+            depth_np = skin_y_np[coords_np[:, 0], coords_np[:, 2]] - coords_np[:, 1]
+            q25, q50, q75 = np.percentile(depth_np, [25, 50, 75])
+            counts = ", ".join(
+                f"<={c}vox:{(depth_np <= c).mean()*100:.0f}%" for c in (20, 30, 40, 50, 60, 75, 90)
+            )
+            print(f"[EROSION-DEPTH] {patient_id}: depth-from-skin quartiles "
+                  f"25%={q25:.0f} 50%={q50:.0f} 75%={q75:.0f} vox | fraction of pool retained at cutoff: {counts}")
+        print(f"[EROSION] {patient_id}: {coords.shape[0]} valid (x,y,z) target centers "
+              f"(fit the liver >=99% + WHOLE sphere within {effective_max_depth_voxels:.1f} vox of skin "
+              f"[{max_visible_depth_voxels:.1f} nominal - {radius_voxels:.1f} radius margin], full liver depth) "
+              f"— depth range: {y_span}")
+        torch.save(coords.cpu(), cache_path)
+        return coords
+
     def _inject_target_volume(self):
         """One-time injection of a small spherical target sub-volume into the patient's
         label map, only overwriting liver voxels. Used for the 3D coverage-based reward
@@ -735,21 +872,44 @@ class roboticUSEnv(DirectRLEnv):
             return
 
         radius_mm = float(target_cfg["radius_mm"])
-        radius_voxels = radius_mm / (self.US_slicer.label_res * 1000.0)
+        radius_voxels = radius_mm / (self.US_slicer.label_res * 1000.0)  # e.g. 15mm / 1.5mm/vox = 10 voxels (NOT 15 — 15 is the mm value)
         target_label_id = int(target_cfg["label_id"])
         r_int = int(radius_voxels) + 1
 
-        # per-human-type bookkeeping needed for 3D coverage tracking (step 2)
+        # position-independent sphere kernel 
+        
+        offsets = torch.arange(-r_int, r_int + 1, device=self.sim.device)
+        dist2_kernel = offsets.view(-1, 1, 1) ** 2 + offsets.view(1, -1, 1) ** 2 + offsets.view(1, 1, -1) ** 2
+        kernel = dist2_kernel <= radius_voxels ** 2
+        n_sphere = int(kernel.sum().item())
+
+        # probe's actual visible imaging depth, converted from the US image's physical
+        # size into label-map voxels: image_size[1] px * resolution m/px = physical depth
+        # the rendered image spans; / label_res = that same depth in label-map voxels.
+        us_cfg_depth = YAML().load(open(f"{PACKAGE_DIR}/lab/sensors/cfgs/us_cfg.yaml", "r"))
+        max_visible_depth_voxels = (us_cfg_depth["image_size"][1] * us_cfg_depth["resolution"]) / self.US_slicer.label_res
+
+        # per-human-type bookkeeping needed for 3D coverage tracking
         self.target_bbox_list = []
-        self.target_mask_local_list = []
+        self.target_mask_local_list = []  # FULL sphere mask — coverage/success tracking AND restore-to-liver
         self.target_total_voxels_list = []
+        self.target_valid_xyz_list = []  # NEW: per-patient (N,3) erosion-+-depth-valid (cx,cy,cz) coords
 
         for i in range(self.US_slicer.n_human_types):
-            # per-patient target center (falls back to the global center_voxel)
+            # per-patient target center — only used as the ONE-TIME seed injection below,
+            # before the first _randomize_target call; the actual random picks used for
+            # every episode after that come entirely from target_valid_xyz_list.
             patient_id = patient_cfg["id_list"][i]
             cx, cy, cz = [int(v) for v in get_patient_param(patient_id, "center_voxel", target_cfg["center_voxel"])]
             label_map = self.US_slicer.label_maps[i]
             X, Y, Z = label_map.shape
+            cy = min(max(cy, r_int), Y - r_int - 1)
+
+            valid_xyz = self._construct_target_valid_xyz(
+                patient_id, human_stl_list[i], label_map, kernel, n_sphere, r_int,
+                self.US_slicer.surface_map_list[i], max_visible_depth_voxels, radius_voxels,
+            )
+            self.target_valid_xyz_list.append(valid_xyz)
 
             x_min, x_max = max(cx - r_int, 0), min(cx + r_int + 1, X)
             y_min, y_max = max(cy - r_int, 0), min(cy + r_int + 1, Y)
@@ -763,7 +923,7 @@ class roboticUSEnv(DirectRLEnv):
 
             local_block = label_map[x_min:x_max, y_min:y_max, z_min:z_max]
             liver_mask = local_block == self.cfg.LIVER_LABEL_ID
-            write_mask = sphere_mask & liver_mask
+            write_mask = sphere_mask & liver_mask  # full sphere — injected/visible AND what coverage is measured on
             local_block[write_mask] = target_label_id
             label_map[x_min:x_max, y_min:y_max, z_min:z_max] = local_block
 
@@ -772,8 +932,10 @@ class roboticUSEnv(DirectRLEnv):
                   f"{target_label_id} around center ({cx},{cy},{cz}), "
                   f"radius {radius_voxels:.1f} voxels ({radius_mm}mm)")
 
-            # store for 3D coverage tracking: where the target sits (bbox) and which
-            # voxels inside that bbox actually belong to the target (write_mask)
+            # store for 3D coverage tracking: where the target sits (bbox) and the full
+            # injected sphere mask — used both for coverage/success measurement AND to
+            # restore the whole region back to liver when the target moves (no separate
+            # "core" subset anymore — the whole sphere counts).
             self.target_bbox_list.append((x_min, x_max, y_min, y_max, z_min, z_max))
             self.target_mask_local_list.append(write_mask.clone())
             self.target_total_voxels_list.append(n_voxels)
@@ -781,7 +943,12 @@ class roboticUSEnv(DirectRLEnv):
         self._init_coverage_buffers()
 
     def _randomize_target(self, env_ids):
-        """Pick a new random (cx, cz) within liver bounds, restore old sphere, inject new one."""
+        """Pick a new random (cx, cz) within liver bounds, restore old sphere, inject new one.
+        Scoped to the patient type(s) touched by env_ids only — each env's target is now
+        re-randomized independently, the moment THAT env finishes (see _reset_idx). Was:
+        looped over every patient type unconditionally on every call, so any single env
+        finishing re-shuffled ALL 10 patients' targets and zeroed episode_length_buf for
+        every env, not just the one that actually finished."""
         target_cfg = scene_cfg.get("target_volume", {})
         if not target_cfg.get("randomize", False):
             return
@@ -795,55 +962,89 @@ class roboticUSEnv(DirectRLEnv):
         xs_rel = offsets.view(-1, 1, 1)
         ys_rel = offsets.view(1, -1, 1)
         zs_rel = offsets.view(1, 1, -1)
-        sphere_mask = (xs_rel ** 2 + ys_rel ** 2 + zs_rel ** 2) <= radius_voxels ** 2
+        dist2_rel = xs_rel ** 2 + ys_rel ** 2 + zs_rel ** 2
+        sphere_mask = dist2_rel <= radius_voxels ** 2
         n_sphere = int(sphere_mask.sum().item())       # theoretical max (e.g. 4169)
-        min_target_voxels = int(0.99 * n_sphere)       # accept if ≥99% of sphere is liver (allows vessels)
+        # (99%-liver-fit + probe-visible-depth check now lives entirely in the precomputed
+        # target_valid_xyz_list — see _construct_target_valid_xyz — not checked here anymore)
 
-        for i in range(self.US_slicer.n_human_types):
-            # per-patient liver bounds + depth (fall back to the global target_volume fields)
+        n_types = self.US_slicer.n_human_types
+        env_ids_t = torch.as_tensor(env_ids, device=self.sim.device)
+        affected_types = torch.unique(env_ids_t % n_types).tolist()
+
+        for i in affected_types:
             patient_id = patient_cfg["id_list"][i]
-            x_lo, x_hi = get_patient_param(patient_id, "liver_x_range", target_cfg["liver_x_range"])
-            z_lo, z_hi = get_patient_param(patient_id, "liver_z_range", target_cfg["liver_z_range"])
-            cy = int(get_patient_param(patient_id, "center_voxel", target_cfg["center_voxel"])[1])  # Y depth
             label_map = self.US_slicer.label_maps[i]
             X, Y, Z = label_map.shape
-            cy = min(max(cy, r_int), Y - r_int - 1)  # keep sphere inside volume depth (avoids size mismatch)
 
-            # restore old sphere voxels back to liver
+            # restore old sphere voxels back to liver — the full sphere that was actually
+            # injected (target_mask_local_list is the full sphere again, not a core subset)
             ox0, ox1, oy0, oy1, oz0, oz1 = self.target_bbox_list[i]
             old_block = label_map[ox0:ox1, oy0:oy1, oz0:oz1]
             old_block[self.target_mask_local_list[i]] = self.cfg.LIVER_LABEL_ID
             label_map[ox0:ox1, oy0:oy1, oz0:oz1] = old_block
 
-            # retry until the full sphere fits entirely inside liver tissue
-            n_voxels = 0
-            write_mask = sphere_mask  # fallback if no perfect position found
-            x_min = x_max = y_min = y_max = z_min = z_max = 0
-            cx = cz = 0
-            for attempt in range(200):
-                # liver_x_range / liver_z_range are already the patient-specific safe center ranges
-                cx = int(torch.randint(x_lo, x_hi + 1, (1,)).item())
-                cz = int(torch.randint(z_lo, z_hi + 1, (1,)).item())
-                cx = min(max(cx, r_int), X - r_int - 1)  # keep sphere inside volume (avoids size mismatch)
-                cz = min(max(cz, r_int), Z - r_int - 1)
+            # sample a GUARANTEED-valid (x, y, z) from the precomputed erosion+depth-valid list for this patient type
+            valid_xyz = self.target_valid_xyz_list[i]
 
-                x_min, x_max = cx - r_int, cx + r_int + 1
-                y_min, y_max = cy - r_int, cy + r_int + 1
-                z_min, z_max = cz - r_int, cz + r_int + 1
+            # depth-curriculum diagnostic: ALL 10 envs share ONE depth cutoff per ROUND (not
+            # a fresh random pick per env-call) — the same cutoff stays active for every
+            # env until the round's 10-slot buffer fills, at which point _get_dones picks a
+            # new one for the next round. This lets a round cleanly answer "out of 10 envs,
+            # how many succeeded at depth=X" as one exact percentage, instead of the earlier
+            # per-env-independent design's confusing slowly-converging running average.
+            depth_buckets = target_cfg.get("depth_curriculum_voxels", [90])
+            if not hasattr(self, "_current_depth_cutoff"):
+                self._current_depth_cutoff = depth_buckets[int(torch.randint(0, len(depth_buckets), (1,)).item())]
+            chosen_depth_cutoff = self._current_depth_cutoff
+            if not hasattr(self, "target_depth_cutoff_per_env"):
+                self.target_depth_cutoff_per_env = torch.zeros(self.scene.num_envs, device=self.sim.device)
 
-                local_block = label_map[x_min:x_max, y_min:y_max, z_min:z_max]
-                liver_mask = local_block == self.cfg.LIVER_LABEL_ID
-                write_mask = sphere_mask & liver_mask # only voxels inside the sphere and liver are written
-                n_voxels = int(write_mask.sum().item())
-
-                if n_voxels >= min_target_voxels:  # ≥99% of sphere is liver tissue
-                    break
-
-            if n_voxels < min_target_voxels:
-                print(f"[TARGET WARNING] type={i}: could not reach {min_target_voxels} voxels after 200 tries. "
-                      f"Best: {n_voxels} at cx={cx} cz={cz}")
+            if valid_xyz.shape[0] == 0:
+                # defensive fallback only — shouldn't happen for any sanely-tuned patient
+                # (s0030 alone had ~37% of its liver volume valid in offline testing)
+                print(f"[TARGET WARNING] type={i}: erosion mask is empty, "
+                      f"falling back to the seed center_voxel — check this patient's tuning")
+                seed_cx, seed_cy, seed_cz = get_patient_param(patient_id, "center_voxel", target_cfg["center_voxel"])
+                cx, cy, cz = int(seed_cx), int(seed_cy), int(seed_cz)
             else:
-                print(f"[TARGET VOLUME] type={i}: cx={cx} cy={cy} cz={cz} → {n_voxels}/{n_sphere} voxels (full sphere in liver)")
+                skin_y_this = self.US_slicer.surface_map_list[i]  # (X, Z)
+                depth_from_skin = skin_y_this[valid_xyz[:, 0], valid_xyz[:, 2]] - valid_xyz[:, 1]
+                within_cutoff = depth_from_skin <= chosen_depth_cutoff
+                pool = valid_xyz[within_cutoff] if within_cutoff.any() else valid_xyz  # fall back to full range if this patient has nothing that shallow
+                pick = pool[torch.randint(0, pool.shape[0], (1,), device=self.sim.device)][0]
+                cx, cy, cz = int(pick[0].item()), int(pick[1].item()), int(pick[2].item())
+
+            for b in range(self.scene.num_envs):
+                if b % n_types == i:
+                    self.target_depth_cutoff_per_env[b] = chosen_depth_cutoff
+
+            # clamp so the fixed-size sphere_mask kernel (2*r_int+1 in
+            # every dim, built once above) always ANDs against a same-shaped liver_mask
+            # slice. Erosion only guarantees >=99% of the sphere is LIVER near a boundary
+            # — it does NOT guarantee the full bbox stays inside the array. A sliver
+            # poking past the edge can be well under 1% of the sphere (easily clears the
+            # 99% threshold) while still silently truncating the slice below 2*r_int+1,
+            # which is exactly what crashed here (23 vs 22).
+            cx = min(max(cx, r_int), X - r_int - 1)
+            cy = min(max(cy, r_int), Y - r_int - 1)
+            cz = min(max(cz, r_int), Z - r_int - 1)
+
+            x_min, x_max = cx - r_int, cx + r_int + 1
+            y_min, y_max = cy - r_int, cy + r_int + 1
+            z_min, z_max = cz - r_int, cz + r_int + 1
+
+            local_block = label_map[x_min:x_max, y_min:y_max, z_min:z_max]
+            liver_mask = local_block == self.cfg.LIVER_LABEL_ID
+            write_mask = sphere_mask & liver_mask  # full sphere — injected/visible AND counts toward coverage
+            n_voxels = int(write_mask.sum().item())
+
+            # gated like [EPISODE END]/[PROGRESS]/[POSE] — this fires on every single
+            # per-env target reset (frequent, esp. with fast patients), so it's log spam
+            # during a real training run; still useful when you actually want to watch it
+            if os.environ.get("SONOGYM_INFERENCE"):
+                print(f"[TARGET VOLUME] type={i}: cx={cx} cy={cy} cz={cz} → {n_voxels}/{n_sphere} voxels "
+                      f"(erosion-guaranteed fit)")
 
             # write confirmed position into label map
             local_block = label_map[x_min:x_max, y_min:y_max, z_min:z_max]
@@ -854,27 +1055,42 @@ class roboticUSEnv(DirectRLEnv):
             self.target_mask_local_list[i] = write_mask.clone()
             self.target_total_voxels_list[i] = n_voxels
 
-        # update ALL envs — shared target changed for everyone
+        # update only the envs belonging to the affected patient type(s) — not every env.
+        # (today num_envs == n_patients, so this is exactly the one env in env_ids; if
+        # num_envs > n_patients later, every env sharing an affected type gets the new
+        # target here since they physically share the same label_map voxels — but only
+        # the ones actually in env_ids also get scanned-mask/episode-budget resets below,
+        # so multiple envs per patient would need that reset scoped per-type too at that
+        # point, mirroring what used to be global here.)
         num_envs = self.scene.num_envs
-        for b in range(num_envs):
-            hi = b % self.US_slicer.n_human_types
-            self.target_total_per_env[b] = self.target_total_voxels_list[hi]
-            x_min, x_max, _, _, z_min, z_max = self.target_bbox_list[hi]
-            self.target_center_per_env[b, 0] = (x_min + x_max) / 2.0
-            self.target_center_per_env[b, 1] = (z_min + z_max) / 2.0
+        for i in affected_types:
+            for b in range(num_envs):
+                if b % n_types == i:
+                    self.target_total_per_env[b] = self.target_total_voxels_list[i]
+                    x_min, x_max, y_min, y_max, z_min, z_max = self.target_bbox_list[i]
+                    self.target_center_per_env[b, 0] = (x_min + x_max) / 2.0
+                    self.target_center_per_env[b, 1] = (z_min + z_max) / 2.0
+                    self.target_depth_per_env[b] = (y_min + y_max) / 2.0
 
-        # clear ALL scanned masks — progress toward old target is meaningless
+        # clear scanned masks only for the affected type(s) — was clearing every type's
+        # mask on every call, wiping OTHER unrelated patients' mid-episode scan progress
         if hasattr(self, "scanned_target_mask"):
-            for mask in self.scanned_target_mask:
-                mask[:] = False
-        # give ALL envs a fresh episode budget on the new target
-        self.episode_length_buf[:] = 0
+            for i in affected_types:
+                self.scanned_target_mask[i][:] = False
+        # fresh episode budget only for the env(s) that actually got a new target (the
+        # IsaacLab base _reset_idx already zeroes episode_length_buf for these same
+        # env_ids too — this is a harmless redundant write, kept for clarity/safety)
+        self.episode_length_buf[env_ids_t] = 0
 
         if hasattr(self, "_prev_coords_per_type"):
-            self._prev_coords_per_type.clear()
+            for i in affected_types:
+                self._prev_coords_per_type.pop(i, None)
 
-        if hasattr(self, "_target_round_log"):
-            self._reset_target_round_log()
+        # _target_round_log is intentionally NOT reset here anymore — it's a separate,
+        # purely-bookkeeping wandb accumulator that fills in one env's slot per completed
+        # episode (see _get_dones) and is reset only once ALL envs have contributed a
+        # sample. Resetting it here on every single-env target change used to wipe out
+        # other envs' already-recorded samples before they could ever be flushed.
 
         if hasattr(self, "_voxel_markers"):
             self._refresh_voxel_visualizer_geometry()
@@ -888,6 +1104,32 @@ class roboticUSEnv(DirectRLEnv):
             "term": torch.zeros(num_envs, device=self.sim.device),
             "rc": torch.zeros(num_envs, device=self.sim.device),
             "ep_reward": torch.zeros(num_envs, device=self.sim.device),
+            "depth": torch.zeros(num_envs, device=self.sim.device),  # NEW: target depth (cy) that episode used
+        }
+
+    def _reset_round_step_stats(self):
+        """Running per-STEP statistics for the current round window, reset when the
+        round's 10-slot buffer flushes (see _reset_target_round_log). Replaces the old
+        _wandb_cache, which was overwritten every step and only ever reported whatever
+        single step happened to trigger the flush — not an aggregate over the round at
+        all, which is why reward_max rarely showed the terminal bonus even though it
+        was firing constantly. This accumulates sum/count/max/min across EVERY step of
+        EVERY env since the last flush, so the reduction at flush time is a true
+        mean/max/min over the whole round, not a one-step snapshot."""
+        self._round_step_stats = {
+            "reward_sum": 0.0, "reward_count": 0, "reward_max": -float("inf"), "reward_min": float("inf"),
+            "rv_sum": 0.0, "rv_count": 0,
+            "rs_sum": 0.0, "rs_count": 0,  # alpha2 is active (nonzero) — rs feeds training, log it
+            "liver_frac_sum": 0.0, "liver_frac_count": 0,
+            "shadow_ok_sum": 0.0, "shadow_ok_count": 0,
+            "shadow_fraction_sum": 0.0, "shadow_fraction_count": 0,
+            "r_explore_sum": 0.0, "r_explore_count": 0,
+            # rv averaged ONLY over steps where the target is actually visible — rv_mean
+            # (above) is diluted by the many steps target isn't in view at all (mostly
+            # search/sweep), so it understates the per-step reward actually competing
+            # against r_explore/w_explore at the moment that matters. This is the number
+            # to check before deciding whether alpha_vis needs raising.
+            "rv_on_target_sum": 0.0, "rv_on_target_count": 0,
         }
 
     def _init_coverage_buffers(self):
@@ -910,7 +1152,7 @@ class roboticUSEnv(DirectRLEnv):
         self.rc_episode_sum = torch.zeros(num_envs, device=self.sim.device)
         self.reached_95 = torch.zeros(num_envs, dtype=torch.bool, device=self.sim.device)
 
-        # Per-episode accumulators for paper Eq. 6 terminal reward: D and P
+        # Per-episode accumulators terminal reward: D and P
         self.episode_dist_sum   = torch.zeros(num_envs, device=self.sim.device)  # Σ dt/Rc
         self.episode_rs_sum     = torch.zeros(num_envs, device=self.sim.device)  # Σ (1-pt)
         self.episode_step_count = torch.zeros(num_envs, device=self.sim.device)  # T
@@ -921,14 +1163,19 @@ class roboticUSEnv(DirectRLEnv):
         self.run_ep_reward_sum = 0.0
         self.run_done_count = 0
         self._reset_target_round_log()
+        self._reset_round_step_stats()
 
         # Target center (x, z) in voxel space per env — used for attenuation distance ra
         self.target_center_per_env = torch.zeros(num_envs, 2, device=self.sim.device)
+        # Target depth (y) per env — NEW, informational (wandb) now that depth varies;
+        # not used by any reward term, just logged so depth randomization is observable.
+        self.target_depth_per_env = torch.zeros(num_envs, device=self.sim.device)
         for b in range(num_envs):
             hi = b % self.US_slicer.n_human_types
-            x_min, x_max, _, _, z_min, z_max = self.target_bbox_list[hi]
+            x_min, x_max, y_min, y_max, z_min, z_max = self.target_bbox_list[hi]
             self.target_center_per_env[b, 0] = (x_min + x_max) / 2.0  # cx
             self.target_center_per_env[b, 1] = (z_min + z_max) / 2.0  # cz
+            self.target_depth_per_env[b] = (y_min + y_max) / 2.0      # cy
      
     # Added: 3D coverage visualizer for Isaac Sim viewport
     def _init_voxel_visualizer(self):
@@ -1295,7 +1542,7 @@ class roboticUSEnv(DirectRLEnv):
                 if hasattr(self, "target_bbox_list"):
                     self._update_voxel_viz()
 
-                VIZ_EVERY = 10 # was 10; 1 = matplotlib in lock-step with the probe (slower). Try 2-3 if too slow.
+                VIZ_EVERY = 3 # matplotlib in lock-step with the probe (slower). Try 2-3 if too slow.
                 if self._viz_step % VIZ_EVERY == 0:
                     # pick env 0 for plotting
                     label2d = label_hw[0]  # (H,W)
@@ -1532,10 +1779,27 @@ class roboticUSEnv(DirectRLEnv):
         if self.w_explore > 0.0:
             probe_xz = self.US_slicer.current_x_z_x_angle_cmd[:, :2]  # (B, 2) voxel coords
             if not hasattr(self, "_visited_step"):
-                xzr = self.sim_cfg["patient_xz_range"]
-                self._ex_x0, self._ex_z0 = xzr[0][0], xzr[0][1]
-                self._ex_nx = int((xzr[1][0] - xzr[0][0]) / self.explore_cell) + 2
-                self._ex_nz = int((xzr[1][1] - xzr[0][1]) / self.explore_cell) + 2
+                # PER-ENV grid origin (each env's own patient_xz_range) — was a single
+                # global origin/size from patient_xz_range (s0030's box), which aliased
+                # every other patient's wider-ranging probe positions onto s0030-sized
+                # grid cells (clamped), collapsing the re-sweep exploration bonus for them.
+                # Grid is sized to the widest patient span so every patient's full range
+                # of cells fits; narrower patients simply use a subset of the grid.
+                n_patients = len(patient_cfg["id_list"])
+                self._ex_x0 = torch.zeros(B, device=self.sim.device)
+                self._ex_z0 = torch.zeros(B, device=self.sim.device)
+                max_span_x = max_span_z = 0.0
+                for i, patient_id in enumerate(patient_cfg["id_list"]):
+                    xzr = get_patient_param(patient_id, "patient_xz_range", self.sim_cfg["patient_xz_range"])
+                    x0, z0 = xzr[0][0], xzr[0][1]
+                    span_x, span_z = xzr[1][0] - xzr[0][0], xzr[1][1] - xzr[0][1]
+                    max_span_x, max_span_z = max(max_span_x, span_x), max(max_span_z, span_z)
+                    for env_idx in range(B):
+                        if env_idx % n_patients == i:
+                            self._ex_x0[env_idx] = x0
+                            self._ex_z0[env_idx] = z0
+                self._ex_nx = int(max_span_x / self.explore_cell) + 2
+                self._ex_nz = int(max_span_z / self.explore_cell) + 2
                 # episode-step each cell was last visited; -large = never visited → rewardable
                 self._visited_step = torch.full((B, self._ex_nx, self._ex_nz), -(10**9), dtype=torch.long, device=self.sim.device)
             cx = ((probe_xz[:, 0] - self._ex_x0) / self.explore_cell).long().clamp(0, self._ex_nx - 1)
@@ -1571,10 +1835,11 @@ class roboticUSEnv(DirectRLEnv):
             torch.zeros(B, device=self.sim.device),
             torch.full((B,), 0.1, device=self.sim.device),
         )
-        reward = rt - liver_penalty - shadow_penalty
+        reward = rt - liver_penalty - self.time_penalty
 
-        # per-step living cost: each extra step lowers the return 
-        # encourages finishing fast
+        # per-step living cost: each extra step lowers the return, encourages finishing
+        # fast. Was dead code (self.time_penalty loaded from config but never subtracted
+        # anywhere) — restored.
 
         # accumulate D and P  
         if hasattr(self, "episode_dist_sum"):
@@ -1596,8 +1861,8 @@ class roboticUSEnv(DirectRLEnv):
             P = self.episode_rs_sum / T                       # avg shadow-free fraction
             r_end = self.terminal_bonus_kend * (1.0 + self.alpha1 / D + self.alpha2 * P)
             # add terminal bonus only on first crossing 0.85 (once per episode)
-            just_crossed = (cov_frac >= 0.95) & ~self.reached_95
-            self.reached_95 = self.reached_95 | (cov_frac >= 0.95)
+            just_crossed = (cov_frac >= 0.85) & ~self.reached_95
+            self.reached_95 = self.reached_95 | (cov_frac >= 0.85)
             reward = reward + torch.where(
                 just_crossed,
                 r_end,
@@ -1608,17 +1873,34 @@ class roboticUSEnv(DirectRLEnv):
         if hasattr(self, "rc_episode_sum"):
             self.rc_episode_sum += rc
 
-        # cache for episode-end logging in _get_dones()
-        self._wandb_cache = {
-            "ra_mean": ra.mean().item(),
-            "rv_mean": rv.mean().item(),
-            "liver_frac_mean": liver_frac.mean().item(),
-            "rs_mean": rs.mean().item(),
-            "shadow_ok_frac": shadow_ok.float().mean().item(),
-            "shadow_fraction": shadow_fraction.mean().item(),
-            "reward_mean": reward.mean().item(),
-            "reward_max": reward.max().item(),
-        }
+        # accumulate this step into the round-window stats — flushed/reduced (and reset)
+        # in _get_dones() once the round's 10-slot buffer fills. See _reset_round_step_stats
+        # for why this replaces the old per-step-snapshot _wandb_cache.
+        if not hasattr(self, "_round_step_stats"):
+            self._reset_round_step_stats()
+        s = self._round_step_stats
+        s["reward_sum"]   += float(reward.sum().item())
+        s["reward_count"] += reward.numel()
+        s["reward_max"]    = max(s["reward_max"], float(reward.max().item()))
+        s["reward_min"]    = min(s["reward_min"], float(reward.min().item()))
+        s["rv_sum"]        += float(rv.sum().item())
+        s["rv_count"]      += rv.numel()
+        s["rs_sum"]        += float(rs.sum().item())
+        s["rs_count"]      += rs.numel()
+        s["r_explore_sum"]   += float(r_explore.sum().item())
+        s["r_explore_count"] += r_explore.numel()
+        if hasattr(self, "visible_target_count"):
+            on_target = self.visible_target_count > 0
+            if on_target.any():
+                s["rv_on_target_sum"]   += float(rv[on_target].sum().item())
+                s["rv_on_target_count"] += int(on_target.sum().item())
+        s["liver_frac_sum"]   += float(liver_frac.sum().item())
+        s["liver_frac_count"] += liver_frac.numel()
+        s["shadow_ok_sum"]     += float(shadow_ok.float().sum().item())
+        s["shadow_ok_count"]   += shadow_ok.numel()
+        s["shadow_fraction_sum"]   += float(shadow_fraction.sum().item())
+        s["shadow_fraction_count"] += shadow_fraction.numel()
+
         self.total_reward += reward
 
         return reward
@@ -1627,7 +1909,9 @@ class roboticUSEnv(DirectRLEnv):
         num_envs = self.scene.num_envs
         n_types = self.US_slicer.n_human_types
 
-        # pending synchronized reset: flush all envs through the proper done path
+        # vestigial: _pending_sync_reset is never set to True anymore (target
+        # randomization is per-env/immediate now, see _reset_idx / _randomize_target) —
+        # left in place as a harmless no-op safety net.
         if getattr(self, "_pending_sync_reset", False):
             terminated = torch.zeros(num_envs, dtype=torch.bool, device=self.sim.device)
             time_outs  = torch.ones(num_envs,  dtype=torch.bool, device=self.sim.device)
@@ -1644,9 +1928,9 @@ class roboticUSEnv(DirectRLEnv):
             coverage_fraction = torch.zeros(num_envs, device=self.sim.device)
 
         terminated = torch.zeros(num_envs, dtype=torch.bool, device=self.sim.device)
-        terminated |= (coverage_fraction >= 0.95)
+        terminated |= (coverage_fraction >= 0.85)
         # success =  85% coverage  400 steps
-        success = (coverage_fraction >= 0.95) & (self.episode_length_buf <= 250)
+        success = (coverage_fraction >= 0.85) & (self.episode_length_buf <= 360)
 
         time_outs = self.episode_length_buf >= self.max_episode_length - 1
 
@@ -1655,14 +1939,18 @@ class roboticUSEnv(DirectRLEnv):
         if os.environ.get("SONOGYM_INFERENCE") and episode_done.any():
             for env_id in episode_done.nonzero(as_tuple=False).squeeze(-1).tolist():
                 outcome = "SUCCESS" if success[env_id] else "TIMEOUT"
-                print(f"[EPISODE END] env={env_id} | {outcome} | coverage={coverage_fraction[env_id]:.3f} | steps={self.episode_length_buf[env_id].item()}")
-
+                expected_patient = patient_cfg["id_list"][env_id % n_types]
+                print(f"[EPISODE END] env={env_id} (patient={expected_patient}) | {outcome} | coverage={coverage_fraction[env_id]:.3f} | steps={self.episode_length_buf[env_id].item()}")
+                # proof, not theory: query the LIVE USD stage for whichever mesh is
+                # actually resolved for this env's Human prim right now, and flag it if
+                # it doesn't match the patient env_id is supposed to be running.
+                
         # rc reset
         rc_done_tensor = torch.zeros(num_envs, device=self.sim.device)
         if hasattr(self, "rc_episode_sum") and episode_done.any():
             rc_done_tensor[episode_done] = self.rc_episode_sum[episode_done]
             self.rc_episode_sum[episode_done] = 0.0
-
+       
         ep_reward_done_tensor = torch.zeros(num_envs, device=self.sim.device)
         if hasattr(self, "total_reward") and episode_done.any():
             ep_reward_done_tensor[episode_done] = self.total_reward[episode_done]
@@ -1674,32 +1962,85 @@ class roboticUSEnv(DirectRLEnv):
             self.run_ep_reward_sum += float(self.total_reward[episode_done].sum().item())
             self.run_done_count += done_count
             self.total_reward[episode_done] = 0.0
-
+        #wandb logging: only when an episode finishes
         if wandb.run is not None and episode_done.any():
             if not hasattr(self, "_target_round_log"):
                 self._reset_target_round_log()
+            if not hasattr(self, "_round_step_stats"):
+                self._reset_round_step_stats()
 
-            record_mask = episode_done & ~self._target_round_log["seen"]
+            record_mask = episode_done & ~self._target_round_log["seen"] #seen means slot is locked until the whole buffer resets
             if record_mask.any():
                 self._target_round_log["seen"][record_mask] = True
                 self._target_round_log["cov"][record_mask] = coverage_fraction[record_mask]
                 self._target_round_log["term"][record_mask] = terminated[record_mask].float()  # any-time 85% (real success rate), not just ≤400 steps
                 self._target_round_log["rc"][record_mask] = rc_done_tensor[record_mask]
                 self._target_round_log["ep_reward"][record_mask] = ep_reward_done_tensor[record_mask]
+                self._target_round_log["depth"][record_mask] = self.target_depth_per_env[record_mask]
 
-            if self._target_round_log["seen"].all():
-                log_dict = getattr(self, "_wandb_cache", {}).copy()
+            if self._target_round_log["seen"].all(): # all slots have been filled
+                # true round-window aggregates — accumulated across every step of every
+                # env since the last flush (see _reset_round_step_stats), not a single-step
+                # snapshot. ra_mean still dropped: alpha1=0, so it doesn't affect training.
+                # rs_mean kept: alpha2 is active (nonzero) — re-add ra_mean here too if
+                # alpha1 ever gets re-enabled.
+                st = self._round_step_stats
+                log_dict = {}
+                if st["reward_count"] > 0:
+                    log_dict["reward_mean"] = st["reward_sum"] / st["reward_count"]
+                    log_dict["reward_max"]  = st["reward_max"]
+                    log_dict["reward_min"]  = st["reward_min"]
+                if st["rv_count"] > 0:
+                    log_dict["rv_mean"] = st["rv_sum"] / st["rv_count"]
+                if st["rs_count"] > 0:
+                    log_dict["rs_mean"] = st["rs_sum"] / st["rs_count"]
+                if st["r_explore_count"] > 0:
+                    log_dict["r_explore_mean"] = st["r_explore_sum"] / st["r_explore_count"]
+                if st["rv_on_target_count"] > 0:
+                    log_dict["rv_mean_on_target"] = st["rv_on_target_sum"] / st["rv_on_target_count"]
+                if st["liver_frac_count"] > 0:
+                    log_dict["liver_frac_mean"] = st["liver_frac_sum"] / st["liver_frac_count"]
+                if st["shadow_ok_count"] > 0:
+                    log_dict["shadow_ok_frac"] = st["shadow_ok_sum"] / st["shadow_ok_count"]
+                if st["shadow_fraction_count"] > 0:
+                    log_dict["shadow_fraction"] = st["shadow_fraction_sum"] / st["shadow_fraction_count"]
+
                 log_dict["episode_volume_fraction_mean"] = self._target_round_log["cov"].mean().item()
                 log_dict["episode_volume_fraction_max"]  = self._target_round_log["cov"].max().item()
                 log_dict["episode_terminated_frac"]      = self._target_round_log["term"].mean().item()
+                log_dict["episode_success_count"] = int(self._target_round_log["term"].sum().item())
                 log_dict["rc_episode_sum_mean"] = self._target_round_log["rc"].mean().item()
                 log_dict["rc_episode_sum_max"]  = self._target_round_log["rc"].max().item()
                 log_dict["episode_reward_mean"] = self._target_round_log["ep_reward"].mean().item()
                 log_dict["episode_reward_max"]  = self._target_round_log["ep_reward"].max().item()
+                
+                for i, patient_id in enumerate(patient_cfg["id_list"]):
+                    env_inds = torch.arange(i, num_envs, n_types, device=self.sim.device)
+                    log_dict[f"episode_volume_fraction/{patient_id}"] = self._target_round_log["cov"][env_inds].mean().item()
+        
+                    log_dict[f"target_depth/{patient_id}"] = self._target_round_log["depth"][env_inds].mean().item()
                 if hasattr(self, "target_total_voxels_list"):
-                    log_dict["target_total_voxels"] = self.target_total_voxels_list[0]
+                    # was hardcoded to target_total_voxels_list[0] (patient #0/s0030 only,
+                    # stale/misleading now that each patient has its own target voxel count)
+                    log_dict["target_total_voxels_mean"] = float(np.mean(self.target_total_voxels_list))
+                    for i, patient_id in enumerate(patient_cfg["id_list"]):
+                        log_dict[f"target_total_voxels/{patient_id}"] = self.target_total_voxels_list[i]
+
+                # depth-curriculum diagnostic: this ROUND's exact result — all 10 envs used
+                # the SAME depth cutoff (self._current_depth_cutoff, set in _randomize_target
+                # and held fixed until this flush), so "term" here is literally X out of 10
+                # envs that succeeded AT THAT DEPTH, this round. One clean data point per
+                # round, not a slowly-converging running average.
+                if hasattr(self, "_current_depth_cutoff"):
+                    success_pct_this_round = self._target_round_log["term"].float().mean().item() * 100.0
+                    log_dict[f"success_pct/depth_{int(self._current_depth_cutoff)}"] = success_pct_this_round
+                    # pick the NEXT round's cutoff now, so every env's following resets use it
+                    depth_buckets = scene_cfg.get("target_volume", {}).get("depth_curriculum_voxels", [90])
+                    self._current_depth_cutoff = depth_buckets[int(torch.randint(0, len(depth_buckets), (1,)).item())]
+
                 wandb.log(log_dict)
                 self._reset_target_round_log()
+                self._reset_round_step_stats()
 
         return terminated, time_outs
 
@@ -1804,24 +2145,29 @@ class roboticUSEnv(DirectRLEnv):
         self.pose_buffer[env_ids] = 0.0
 
         if hasattr(self, "target_bbox_list"):
-            if getattr(self, "_pending_sync_reset", False) and len(env_ids) == self.scene.num_envs:
-                # all envs arrived here via the proper done path — safe to randomize
-                self._pending_sync_reset = False
-                self._randomize_target(env_ids)
-            else:
-                if not hasattr(self, "_envs_reset_this_round"):
-                    self._envs_reset_this_round = set()
-                self._envs_reset_this_round.update(env_ids.tolist())
-                if len(self._envs_reset_this_round) >= self.scene.num_envs:
-                    self._envs_reset_this_round.clear()
-                    self._pending_sync_reset = True  # signal _get_dones to flush all envs next step
+            # Randomize immediately for whichever env(s) just finished, scoped to THEIR
+            # OWN patient type only (_randomize_target scopes itself via env_ids).
+            # Was: wait until every one of the 10 patients had individually finished at
+            # least once, THEN force every env to a synchronized new round together. With
+            # 10 different patients of very different difficulty/speed, a fast/easy one
+            # (e.g. a fixed deterministic init pose landing right next to an easy target)
+            # would finish in ~10 steps and then just replay the SAME un-randomized target
+            # from the SAME start pose over and over while waiting for the slowest patient
+            # to also finish once — zero learning signal for that patient meanwhile, and
+            # it starves every other env of a fresh target too. The forced synchronized
+            # flush (_pending_sync_reset in _get_dones) also clipped whichever envs it
+            # caught mid-episode to a spurious 1-step episode — this is why episode length
+            # (min) in wandb was pinned at 1.
+            self._randomize_target(env_ids)
 
         if hasattr(self, "scanned_target_mask"):
             for i in range(len(self.scanned_target_mask)):
                 self.scanned_target_mask[i][env_ids] = False
 
-        if hasattr(self, "_prev_coords_per_type"):
-            self._prev_coords_per_type.clear()
+        # NOTE: _prev_coords_per_type is no longer blanket-cleared here — _randomize_target
+        # (called above, now unconditional) already pops just the affected type(s). A
+        # blanket .clear() here would undo that scoping and wipe OTHER active patients'
+        # cached coords every time any single env resets.
 
         if hasattr(self, "rc_episode_sum"):
             self.rc_episode_sum[env_ids] = 0.0
@@ -1867,9 +2213,41 @@ class roboticUSEnv(DirectRLEnv):
             ik_commands_pose, self.US_ee_pos_b, self.US_ee_quat_b
         )
 
+        # PER-ENV human body placement — INIT_STATE_HUMAN (used at spawn) only ever
+        # carried patient #0's (id_list[0], i.e. s0030's) pos/euler_yxz, applied to every
+        # env even though each env's mesh is a DIFFERENT patient (MultiUsdFileCfg cycles
+        # usd_file_list per env via index % len(usd_file_list) — confirmed against
+        # IsaacLab's spawn_multi_asset). Every non-#0 patient's individually teleop-tuned
+        # pos/euler_yxz was silently unused. Overwrite here (computed once, cached) with
+        # each env's own patient's tuned transform. Placed here (not _setup_scene) because
+        # root_physx_view isn't alive yet at spawn time; by _reset_idx the sim has already
+        # stepped once and human.data reads below already depend on it being live.
+        if not hasattr(self, "_human_pos_per_env"):
+            n_patients = len(patient_cfg["id_list"])
+            self._human_pos_per_env = torch.zeros((self.scene.num_envs, 3), device=self.sim.device)
+            self._human_quat_per_env = torch.zeros((self.scene.num_envs, 4), device=self.sim.device)  # (w,x,y,z)
+            for i, patient_id in enumerate(patient_cfg["id_list"]):
+                pos = get_patient_param(patient_id, "pos", patient_cfg.get("pos", [0.35, 0.15, 0.6]))
+                euler = get_patient_param(patient_id, "euler_yxz", patient_cfg.get("euler_yxz", [-90.0, 90.0, 0.0]))
+                q = R.from_euler("yxz", euler, degrees=True).as_quat()  # scipy order [x,y,z,w]
+                pos_t = torch.tensor(pos, device=self.sim.device)
+                quat_t = torch.tensor([q[3], q[0], q[1], q[2]], device=self.sim.device)  # -> (w,x,y,z)
+                for env_idx in range(self.scene.num_envs):
+                    if env_idx % n_patients == i:
+                        self._human_pos_per_env[env_idx] = pos_t
+                        self._human_quat_per_env[env_idx] = quat_t
+        _human_root_pose = torch.cat(
+            [
+                self._human_pos_per_env[env_ids] + self.scene.env_origins[env_ids],
+                self._human_quat_per_env[env_ids],
+            ],
+            dim=-1,
+        )
+        self.human.write_root_pose_to_sim(_human_root_pose, env_ids=env_ids)
+
         # inverse kinematics?
         self.world_to_base_pose = self.robot.data.root_link_state_w[:, 0:7]
-        # get human frame  depth: 0.16    
+        # get human frame  depth: 0.16
         self.human_world_poses = self.human.data.body_link_state_w[
             :, 0, 0:7
         ]  # these are already the initial poses

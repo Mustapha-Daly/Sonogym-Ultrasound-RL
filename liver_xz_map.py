@@ -15,7 +15,7 @@ import nibabel as nib
 import numpy as np
 
 
-PATIENT_ID = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("SONOGYM_PATIENT_ID", "s0015")
+PATIENT_ID = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("SONOGYM_PATIENT_ID", "s0030")
 LIVER_ID = 5
 LABEL_MAP_PATH = (
     "/home/yue/ws/sonogym/SonoGym/source/spinal_surgery/spinal_surgery/"

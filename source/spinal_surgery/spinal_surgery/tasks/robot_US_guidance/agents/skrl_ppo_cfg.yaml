@@ -58,9 +58,15 @@ memory:
 # https://skrl.readthedocs.io/en/latest/api/agents/ppo.html
 agent:
   class: PPO
-  rollouts: 720 # must match episode length in sim which is 720 currently
+  rollouts: 360 # must match episode length in sim which is 720 currently
   learning_epochs: 4 # match paper exactly now: reuses the buffer 4 times, 720×4 envs/5 = 576 samples/epoch
-  mini_batches: 12 # buffer = 720 × 8 = 5760 samples was 48*5 epochs=240 gradient steps per rollout was too much for KlAdaptiver and crashed LR, changed to 12 to have only 48 gradient steps, tried 6 but did not work because of memory
+  mini_batches: 5 # buffer = 720 × 10 = 7200 samples (was × 8 pre-multi-patient). mini_batches=12
+  # was tuned for the old 8-env buffer → 480 samples/minibatch; at 10 envs that same 12 gives
+  # ~600 samples/minibatch, which is what pushed the backward pass into CUDA OOM. 15 restores
+  # the exact same 480 samples/minibatch (720*10/15 = 720*8/12 = 480) this config was actually
+  # validated at — same per-step memory footprint, no change to num_envs/patient coverage.
+  # Now 4*15=60 gradient steps/rollout (was 48) — if KL-adaptive LR misbehaves, raise
+  # learning_rate_scheduler_kwargs.kl_threshold slightly (was tuned around the 48-step figure).
   discount_factor: 0.99
   lambda: 0.95
   learning_rate: 1.0e-04 # same as paper
@@ -98,10 +104,10 @@ agent:
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 100000 
+  timesteps: 100000
   environment_info: log
 probe:   #i added this part
-  type: convex          # <<< KEY
+  type: convex          # <<2< KEY
   #radius: 60             # mm, typical convex probe
   fan_angle: 60          # degrees (50–90 common)
   depth: 0.16            # mm (matches image height)
