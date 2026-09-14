@@ -530,6 +530,7 @@ class roboticUSEnv(DirectRLEnv):
         self.w_explore = scene_cfg["reward"].get("w_explore", 0.0)  # visitation bonus per NEW (x,z) cell/episode → drives deliberate sweep
         self.explore_cell = scene_cfg["reward"].get("explore_cell_size", 5.0)  # voxels per exploration grid cell
         self.explore_decay = int(scene_cfg["reward"].get("explore_decay", 50))  # steps before a visited cell is rewardable again; small=more re-sweeping, huge≈once/episode
+        self.explore_hysteresis_steps = int(scene_cfg["reward"].get("explore_hysteresis_steps", 10))  # grace period after losing sight of target before r_explore re-enables
 
 
         self.single_action_space = gym.spaces.Box(
@@ -1542,7 +1543,7 @@ class roboticUSEnv(DirectRLEnv):
                 if hasattr(self, "target_bbox_list"):
                     self._update_voxel_viz()
 
-                VIZ_EVERY = 3 # matplotlib in lock-step with the probe (slower). Try 2-3 if too slow.
+                VIZ_EVERY = 5 # matplotlib in lock-step with the probe (slower). Try 2-3 if too slow.
                 if self._viz_step % VIZ_EVERY == 0:
                     # pick env 0 for plotting
                     label2d = label_hw[0]  # (H,W)
@@ -1813,11 +1814,19 @@ class roboticUSEnv(DirectRLEnv):
         else:
             r_explore = torch.zeros(B, device=self.sim.device)
 
-        # while the target is in view, switch OFF exploration → dwell and scan instead of
-        # being pulled away to sweep fresh cells (rc still drives the on-target scan motion)
+        # while the target is in view (or was within the last few steps), switch OFF
+        # exploration → dwell and scan instead of being pulled away to sweep fresh cells.
+        # Hysteresis (explore_hysteresis_steps grace period) instead of an instant flip:
+        # a momentary loss of sight mid-repositioning shouldn't immediately re-enable the
+        # explore pull and send the agent off to a whole new cell.
         if hasattr(self, "visible_target_count"):
+            if not hasattr(self, "_last_seen_target_step"):
+                self._last_seen_target_step = torch.full((B,), -(10**9), dtype=torch.long, device=self.sim.device)
+            currently_visible = self.visible_target_count > 0
+            self._last_seen_target_step[currently_visible] = self.episode_length_buf[currently_visible]
+            recently_seen = (self.episode_length_buf - self._last_seen_target_step) <= self.explore_hysteresis_steps
             r_explore = torch.where(
-                self.visible_target_count > 0,
+                recently_seen,
                 torch.zeros_like(r_explore),
                 r_explore,
             )
@@ -1861,8 +1870,8 @@ class roboticUSEnv(DirectRLEnv):
             P = self.episode_rs_sum / T                       # avg shadow-free fraction
             r_end = self.terminal_bonus_kend * (1.0 + self.alpha1 / D + self.alpha2 * P)
             # add terminal bonus only on first crossing 0.85 (once per episode)
-            just_crossed = (cov_frac >= 0.85) & ~self.reached_95
-            self.reached_95 = self.reached_95 | (cov_frac >= 0.85)
+            just_crossed = (cov_frac >= 0.80) & ~self.reached_95
+            self.reached_95 = self.reached_95 | (cov_frac >= 0.80)
             reward = reward + torch.where(
                 just_crossed,
                 r_end,
@@ -1928,9 +1937,9 @@ class roboticUSEnv(DirectRLEnv):
             coverage_fraction = torch.zeros(num_envs, device=self.sim.device)
 
         terminated = torch.zeros(num_envs, dtype=torch.bool, device=self.sim.device)
-        terminated |= (coverage_fraction >= 0.85)
-        # success =  85% coverage  400 steps
-        success = (coverage_fraction >= 0.85) & (self.episode_length_buf <= 360)
+        terminated |= (coverage_fraction >= 0.80)
+        # success =  80% coverage  400 steps
+        success = (coverage_fraction >= 0.80) & (self.episode_length_buf <= 360)
 
         time_outs = self.episode_length_buf >= self.max_episode_length - 1
 
@@ -2177,6 +2186,12 @@ class roboticUSEnv(DirectRLEnv):
 
         if hasattr(self, "_visited_step"):
             self._visited_step[env_ids] = -(10**9)  # fresh sweep each episode (all cells rewardable)
+
+        if hasattr(self, "_last_seen_target_step"):
+            # reset so a stale value from the PREVIOUS episode can't make episode_length_buf
+            # (which just reset to 0) look like it's still "recently seen" via a negative
+            # difference — new episode starts with explore fully enabled, as before
+            self._last_seen_target_step[env_ids] = -(10**9)
 
         if hasattr(self, "episode_dist_sum"):
             self.episode_dist_sum[env_ids]   = 0.0

@@ -11,8 +11,8 @@ cd ~/IsaacLab
 PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH \
   ./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/skrl/play.py \
   --task Isaac-robot-US-guidance-v0 \
-  --checkpoint ~/IsaacLab/logs/skrl/US_guidance/2026-09-06_18-29-47_ppo_torch_PPO_US/checkpoints/best_agent.pt \
-  --num_envs 10 \
+  --checkpoint ~/IsaacLab/logs/skrl/US_guidance/2026-09-09_20-17-37_ppo_torch_PPO_US/checkpoints/best_agent.pt \
+  --num_envs 7 \
   --enable_cameras \
   --noise_k 0.0
 """    
