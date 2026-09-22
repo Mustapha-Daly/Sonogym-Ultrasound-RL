@@ -104,7 +104,7 @@ agent:
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 50000
+  timesteps: 75000
   environment_info: log
 probe:   #i added this part
   type: convex          # <<2< KEY

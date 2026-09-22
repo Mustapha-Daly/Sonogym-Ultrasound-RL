@@ -214,8 +214,18 @@ class SharedModel(GaussianMixin, DeterministicMixin, Model):
             nn.Linear(128, 64),
         )
 
+        # Added  target-relative vector [dx, depth, dz].
+        # Sized to match QNet's net_pos above — same 3-value-position shape, same branch depth.
+        self.net_target = nn.Sequential(
+            nn.Linear(observation_space['target_rel'].shape[0], 128),
+            nn.ELU(),
+            nn.Linear(128, 128),
+            nn.ELU(),
+            nn.Linear(128, 64),
+        )
+
         self.net = nn.Sequential(
-            nn.Linear(512 + 64, 256),
+            nn.Linear(512 + 64 + 64, 256),
             nn.ELU(),
             nn.Linear(256, 128),
             nn.ELU(),
@@ -223,7 +233,7 @@ class SharedModel(GaussianMixin, DeterministicMixin, Model):
         )
 
         self.net_value = nn.Sequential(
-            nn.Linear(512 + 64, 256),
+            nn.Linear(512 + 64 + 64, 256),
             nn.ELU(),
             nn.Linear(256, 128),
             nn.ELU(),
@@ -243,10 +253,12 @@ class SharedModel(GaussianMixin, DeterministicMixin, Model):
 
         image = space['image']   # (B, 3, W, H)
         pose = space['pose']     # (B, 12)
+        target_rel = space['target_rel']  # (B, 3): [dx, depth, dz]
 
         features = self.net_features(self.features_extractor(image))
         pose_features = self.net_pose(pose)
-        combined = torch.cat([features, pose_features], dim=-1)
+        target_features = self.net_target(target_rel)
+        combined = torch.cat([features, pose_features, target_features], dim=-1)
 
         if role == "policy":
             return self.net(combined), self.log_std_parameter, {}

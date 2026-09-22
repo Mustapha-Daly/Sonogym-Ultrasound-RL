@@ -238,7 +238,7 @@ class roboticUSEnvCfg(DirectRLEnvCfg):
     episode_length_s = scene_cfg["sim"]["episode_length"]  # 300
     action_scale = 1
     action_space = 4
-    observation_space = {"image": [6, 200, 150], "pose": [24]} # 3 frame image stack + 12 value pose history
+    observation_space = {"image": [6, 200, 150], "pose": [24], "target_rel": [3]} # 3 frame image stack + 12 value pose history + target-relative [dx, depth, dz]
     state_space = 0
     observation_scale = scene_cfg["observation"]["scale"]
     #VERTEBRA_LABEL_ID = 7
@@ -498,10 +498,15 @@ class roboticUSEnv(DirectRLEnv):
         self.observation_space = gym.spaces.Dict({
             "image": gym.spaces.Box(low=0, high=255, shape=(6, _W, _H), dtype=np.float32),
             "pose":  gym.spaces.Box(low=0.0, high=1.0, shape=(24,),     dtype=np.float32),
+            # target_rel: [dx, depth, dz] — dx/dz in [-1,1] (difference of two [0,1] values),
+            # depth in [0,1] (absolute, no probe-side depth to subtract — see step 3).
+            # Low/high just bound the Box declaration; -1..1 safely covers all three.
+            "target_rel": gym.spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32),
         })
         self.single_observation_space["policy"] = gym.spaces.Dict({
             "image": gym.spaces.Box(low=0, high=255, shape=(6, _W, _H), dtype=np.float32),
             "pose":  gym.spaces.Box(low=0.0, high=1.0, shape=(24,),     dtype=np.float32),
+            "target_rel": gym.spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32),
         })
 
         self.termination_direct = True
@@ -512,6 +517,9 @@ class roboticUSEnv(DirectRLEnv):
             .reshape((1, -1))
             .repeat(self.scene.num_envs, 1)
         )
+        self._episode_action_abs_sum = torch.zeros_like(self.action_scale)
+        self._episode_action_clamped_sum = torch.zeros_like(self.action_scale)
+        self._episode_action_step_count = torch.zeros(self.scene.num_envs, device=self.sim.device)
 
         self.w_pos      = scene_cfg["reward"].get("w_pos", 0.0)
         self.w_liver    = scene_cfg["reward"].get("w_liver", 0.0)
@@ -527,6 +535,7 @@ class roboticUSEnv(DirectRLEnv):
         self.alpha_vis     = scene_cfg["reward"].get("alpha_vis", 0.0)
         self.liver_frac_thresh = scene_cfg["reward"].get("liver_frac_thresh", 0.0)  # min liver fraction in view for gate
         self.liver_penalty_k = scene_cfg["reward"].get("liver_penalty_k", 0.1)  # graded liver-penalty scale
+        self.shadow_penalty_k = scene_cfg["reward"].get("shadow_penalty_k", 0.0)  # binary threshold penalty on top of continuous alpha2*rs; 0 = disabled, kept wired in for later
         self.w_explore = scene_cfg["reward"].get("w_explore", 0.0)  # visitation bonus per NEW (x,z) cell/episode → drives deliberate sweep
         self.explore_cell = scene_cfg["reward"].get("explore_cell_size", 5.0)  # voxels per exploration grid cell
         self.explore_decay = int(scene_cfg["reward"].get("explore_decay", 50))  # steps before a visited cell is rewardable again; small=more re-sweeping, huge≈once/episode
@@ -578,6 +587,12 @@ class roboticUSEnv(DirectRLEnv):
                 if env_idx % n_patients == i:
                     self.pose_norm_min_per_env[env_idx] = pose_min
                     self.pose_norm_max_per_env[env_idx] = pose_max
+
+        # target_depth_from_skin_per_env: NOT built here — it's created earlier, inside
+        # _inject_target_volume (which runs before this), since that function needs to
+        # write into it immediately for the seed target. See _normalize_target_position
+        # for how it's used (depth-from-skin / shared effective_max_depth_voxels, same
+        # physical meaning for every patient — replaces the old raw-y per-patient min/max).
 
         self._img_W, self._img_H = us_cfg["image_size"]
 
@@ -771,6 +786,27 @@ class roboticUSEnv(DirectRLEnv):
             self.pose_norm_max_per_env - self.pose_norm_min_per_env + 1e-6
         )
 
+    def _normalize_target_position(self) -> torch.Tensor:
+        """Normalize the CURRENT target's (x, y, z) into each env's [0,1] workspace.
+        x/z: same min-max idea as _normalize_pose, reusing the PROBE's own pose range
+        so target and probe share one frame 
+
+        y (depth): NOT a per-patient min-max instead devided by effective_max_depth_voxels.
+         0 = at skin, 1 = at the probe's real depth limit,
+   
+        Returns: (num_envs, 3) tensor, columns [x_norm, y_norm, z_norm].
+        """
+        x_norm = (self.target_center_per_env[:, 0] - self.pose_norm_min_per_env[:, 0]) / (
+            self.pose_norm_max_per_env[:, 0] - self.pose_norm_min_per_env[:, 0] + 1e-6
+        ) # normalizes target's raw x
+        z_norm = (self.target_center_per_env[:, 1] - self.pose_norm_min_per_env[:, 1]) / (
+            self.pose_norm_max_per_env[:, 1] - self.pose_norm_min_per_env[:, 1] + 1e-6
+        )
+        x_norm = x_norm.clamp(0.0, 1.0)
+        z_norm = z_norm.clamp(0.0, 1.0)
+        y_norm = (self.target_depth_from_skin_per_env / (self.effective_max_depth_voxels + 1e-6)).clamp(0.0, 1.0)
+        return torch.stack([x_norm, y_norm, z_norm], dim=-1)
+
     def _apply_superficial_bone_shadow(self, label_hw: torch.Tensor) -> torch.Tensor:
         B, H, W = label_hw.shape
         shadowed = label_hw.clone()
@@ -890,6 +926,17 @@ class roboticUSEnv(DirectRLEnv):
         us_cfg_depth = YAML().load(open(f"{PACKAGE_DIR}/lab/sensors/cfgs/us_cfg.yaml", "r"))
         max_visible_depth_voxels = (us_cfg_depth["image_size"][1] * us_cfg_depth["resolution"]) / self.US_slicer.label_res
 
+        # SAME formula as inside _construct_target_valid_xyz — patient-agnostic (depends only
+        # on probe geometry + sphere radius, not on any one patient's anatomy), so it's safe to
+        # compute once here and store. This is the shared denominator for normalizing target
+        # depth-from-skin into [0,1] the same way for every patient (see _normalize_target_position).
+        pose_tilt_margin_voxels = target_cfg.get("pose_tilt_margin_voxels", 0)
+        self.effective_max_depth_voxels = max_visible_depth_voxels - radius_voxels - pose_tilt_margin_voxels
+
+        # created HERE, not in the later pose-norm block — this function runs first (called
+        # from __init__ before that block) and needs to write into it a few lines down.
+        self.target_depth_from_skin_per_env = torch.zeros(self.scene.num_envs, device=self.sim.device)
+
         # per-human-type bookkeeping needed for 3D coverage tracking
         self.target_bbox_list = []
         self.target_mask_local_list = []  # FULL sphere mask — coverage/success tracking AND restore-to-liver
@@ -940,6 +987,14 @@ class roboticUSEnv(DirectRLEnv):
             self.target_bbox_list.append((x_min, x_max, y_min, y_max, z_min, z_max))
             self.target_mask_local_list.append(write_mask.clone())
             self.target_total_voxels_list.append(n_voxels)
+
+            # depth-from-skin of this seed target, for the normalized target-position
+            # observation (see _normalize_target_position) — same skin_y source used
+            # everywhere else for this quantity.
+            seed_depth_from_skin = float(self.US_slicer.surface_map_list[i][cx, cz].item()) - cy
+            for b in range(self.scene.num_envs):
+                if b % self.US_slicer.n_human_types == i:
+                    self.target_depth_from_skin_per_env[b] = seed_depth_from_skin
 
         self._init_coverage_buffers()
 
@@ -1008,17 +1063,22 @@ class roboticUSEnv(DirectRLEnv):
                       f"falling back to the seed center_voxel — check this patient's tuning")
                 seed_cx, seed_cy, seed_cz = get_patient_param(patient_id, "center_voxel", target_cfg["center_voxel"])
                 cx, cy, cz = int(seed_cx), int(seed_cy), int(seed_cz)
+                picked_depth_from_skin = float(self.US_slicer.surface_map_list[i][cx, cz].item()) - cy
             else:
                 skin_y_this = self.US_slicer.surface_map_list[i]  # (X, Z)
                 depth_from_skin = skin_y_this[valid_xyz[:, 0], valid_xyz[:, 2]] - valid_xyz[:, 1]
                 within_cutoff = depth_from_skin <= chosen_depth_cutoff
                 pool = valid_xyz[within_cutoff] if within_cutoff.any() else valid_xyz  # fall back to full range if this patient has nothing that shallow
-                pick = pool[torch.randint(0, pool.shape[0], (1,), device=self.sim.device)][0]
+                pool_depth = depth_from_skin[within_cutoff] if within_cutoff.any() else depth_from_skin
+                pick_idx = torch.randint(0, pool.shape[0], (1,), device=self.sim.device)
+                pick = pool[pick_idx][0]
+                picked_depth_from_skin = float(pool_depth[pick_idx].item())
                 cx, cy, cz = int(pick[0].item()), int(pick[1].item()), int(pick[2].item())
 
             for b in range(self.scene.num_envs):
                 if b % n_types == i:
                     self.target_depth_cutoff_per_env[b] = chosen_depth_cutoff
+                    self.target_depth_from_skin_per_env[b] = picked_depth_from_skin
 
             # clamp so the fixed-size sphere_mask kernel (2*r_int+1 in
             # every dim, built once above) always ANDs against a same-shaped liver_mask
@@ -1106,6 +1166,8 @@ class roboticUSEnv(DirectRLEnv):
             "rc": torch.zeros(num_envs, device=self.sim.device),
             "ep_reward": torch.zeros(num_envs, device=self.sim.device),
             "depth": torch.zeros(num_envs, device=self.sim.device),  # NEW: target depth (cy) that episode used
+            "action_abs": torch.zeros(num_envs, self.cfg.action_space, device=self.sim.device),
+            "action_clamped": torch.zeros(num_envs, self.cfg.action_space, device=self.sim.device),
         }
 
     def _reset_round_step_stats(self):
@@ -1131,6 +1193,15 @@ class roboticUSEnv(DirectRLEnv):
             # against r_explore/w_explore at the moment that matters. This is the number
             # to check before deciding whether alpha_vis needs raising.
             "rv_on_target_sum": 0.0, "rv_on_target_count": 0,
+            # actual subtracted penalty amounts (not just their raw underlying fractions
+            # above) — 0 while liver_penalty_k/shadow_penalty_k are 0, but wired in now so
+            # turning either back on later is visible in wandb without extra edits.
+            "liver_penalty_sum": 0.0, "liver_penalty_count": 0,
+            "shadow_penalty_sum": 0.0, "shadow_penalty_count": 0,
+            # terminal bonus actually earned — only increments on the step it fires
+            # (just_crossed), so this is a true per-firing mean, not diluted by all the
+            # steps where it's 0.
+            "r_end_sum": 0.0, "r_end_count": 0,
         }
 
     def _init_coverage_buffers(self):
@@ -1459,11 +1530,20 @@ class roboticUSEnv(DirectRLEnv):
                 current_pose_norm.unsqueeze(1),
             ], dim=1)  # (B, 3, 4)
 
+            # Added for known target position: target-relative vector 
+            target_norm = self._normalize_target_position()   # (B, 3): [x_norm, y_norm, z_norm]
+            probe_xz_norm = current_pose_norm[:, :2]           # (B, 2): [x_norm, z_norm] — reuse, don't recompute
+            self.target_rel_vec = target_norm.clone()
+            self.target_rel_vec[:, 0] -= probe_xz_norm[:, 0]   # dx = target_x - probe_x
+            self.target_rel_vec[:, 2] -= probe_xz_norm[:, 1]   # dz = target_z - probe_z
+            
+
             B = self.scene.num_envs
             observations = {
                 "policy": {
                     "image": self.frame_buffer.clone(),
                     "pose":  self.pose_buffer.reshape(B, -1).clone(), #(B, 3, 4) → (B, 12) flat vector for MLP
+                    "target_rel": self.target_rel_vec.clone(),        # (B, 3): [dx, depth, dz]
                 }
             }
         # -------------------------------------------------
@@ -1644,17 +1724,27 @@ class roboticUSEnv(DirectRLEnv):
         # actions = torch.zeros_like(actions).to(self.sim.device)
         # actions[:, 0] = 1
         if self.action_mode == "continuous":
+            unclamped_actions = actions * self.action_scale
             actions = torch.clamp(
-                actions * self.action_scale, -self.max_action, self.max_action
+                unclamped_actions, -self.max_action, self.max_action
             )
         elif self.action_mode == "discrete":
-            actions = torch.sign(actions) * self.action_scale
+            unclamped_actions = torch.sign(actions) * self.action_scale
+            actions = unclamped_actions
         else:
             raise ValueError("Invalid action mode")
 
         if self.lock_probe_x_angle:
             actions = actions.clone()
+            unclamped_actions = unclamped_actions.clone()
             actions[:, 2] = 0.0
+            unclamped_actions[:, 2] = 0.0
+
+        self._episode_action_abs_sum += actions.abs()
+        self._episode_action_clamped_sum += (
+            unclamped_actions.abs() >= self.max_action - 1e-6
+        ).float()
+        self._episode_action_step_count += 1
 
         self.actions = actions
         # actions: tangential x/y slide in the probe frame
@@ -1842,9 +1932,9 @@ class roboticUSEnv(DirectRLEnv):
         shadow_penalty = torch.where(
             shadow_ok,
             torch.zeros(B, device=self.sim.device),
-            torch.full((B,), 0.1, device=self.sim.device),
+            torch.full((B,), self.shadow_penalty_k, device=self.sim.device),
         )
-        reward = rt - liver_penalty - self.time_penalty
+        reward = rt - liver_penalty - shadow_penalty - self.time_penalty
 
         # per-step living cost: each extra step lowers the return, encourages finishing
         # fast. Was dead code (self.time_penalty loaded from config but never subtracted
@@ -1869,14 +1959,19 @@ class roboticUSEnv(DirectRLEnv):
             D = (self.episode_dist_sum / T).clamp(min=0.05)  # avg normalised distance; clamp avoids 1/D explosion
             P = self.episode_rs_sum / T                       # avg shadow-free fraction
             r_end = self.terminal_bonus_kend * (1.0 + self.alpha1 / D + self.alpha2 * P)
-            # add terminal bonus only on first crossing 0.85 (once per episode)
-            just_crossed = (cov_frac >= 0.80) & ~self.reached_95
-            self.reached_95 = self.reached_95 | (cov_frac >= 0.80)
+            # add terminal bonus only on first crossing 0.90 (once per episode)
+            just_crossed = (cov_frac >= 0.90) & ~self.reached_95
+            self.reached_95 = self.reached_95 | (cov_frac >= 0.90)
             reward = reward + torch.where(
                 just_crossed,
                 r_end,
                 torch.zeros(B, device=self.sim.device),
             )
+            if not hasattr(self, "_round_step_stats"):
+                self._reset_round_step_stats()
+            if just_crossed.any():
+                self._round_step_stats["r_end_sum"]   += float(r_end[just_crossed].sum().item())
+                self._round_step_stats["r_end_count"] += int(just_crossed.sum().item())
 
         # accumulate rc across the episode (reset in _reset_idx)
         if hasattr(self, "rc_episode_sum"):
@@ -1909,8 +2004,179 @@ class roboticUSEnv(DirectRLEnv):
         s["shadow_ok_count"]   += shadow_ok.numel()
         s["shadow_fraction_sum"]   += float(shadow_fraction.sum().item())
         s["shadow_fraction_count"] += shadow_fraction.numel()
+        s["liver_penalty_sum"]   += float(liver_penalty.sum().item())
+        s["liver_penalty_count"] += liver_penalty.numel()
+        s["shadow_penalty_sum"]   += float(shadow_penalty.sum().item())
+        s["shadow_penalty_count"] += shadow_penalty.numel()
 
         self.total_reward += reward
+
+        # Episode-completion bookkeeping, moved here from _get_dones() (see the bug-fix
+        # note there) so it reads total_reward AFTER this step's reward is included.
+        if hasattr(self, "_pending_episode_done"):
+            episode_done = self._pending_episode_done
+            terminated   = self._pending_terminated
+            success      = self._pending_success
+            coverage_fraction = self._pending_coverage_fraction
+            num_envs = self.scene.num_envs
+            n_types = self.US_slicer.n_human_types
+
+            rc_done_tensor = torch.zeros(num_envs, device=self.sim.device)
+            if hasattr(self, "rc_episode_sum") and episode_done.any():
+                rc_done_tensor[episode_done] = self.rc_episode_sum[episode_done]
+                self.rc_episode_sum[episode_done] = 0.0
+
+            ep_reward_done_tensor = torch.zeros(num_envs, device=self.sim.device)
+            if episode_done.any():
+                ep_reward_done_tensor[episode_done] = self.total_reward[episode_done]
+
+            if episode_done.any():
+                # Per-env loop (not a batch sum) so each episode's running mean can be
+                # printed right after IT specifically updates the counters — matters when
+                # several envs finish in the same step, so episode #5's printed rate is
+                # truly "after 5 episodes," not all of this step's finishers lumped together.
+                inference_mode = os.environ.get("SONOGYM_INFERENCE")
+                for env_id in episode_done.nonzero(as_tuple=False).squeeze(-1).tolist():
+                    self.run_done_count += 1
+                    self.run_cov_sum += float(coverage_fraction[env_id].item())
+                    self.run_term_sum += float(success[env_id].item())
+                    self.run_ep_reward_sum += float(self.total_reward[env_id].item())
+                    if inference_mode:
+                        outcome = "SUCCESS" if success[env_id] else "TIMEOUT"
+                        expected_patient = patient_cfg["id_list"][env_id % n_types]
+                        running_mean = self.run_term_sum / self.run_done_count
+                        print(f"[EPISODE END] env={env_id} (patient={expected_patient}) | {outcome} | "
+                              f"coverage={coverage_fraction[env_id]:.3f} | steps={self.episode_length_buf[env_id].item()} "
+                              f"|| [EP {self.run_done_count}] running success rate over {self.run_done_count} "
+                              f"episodes: {running_mean*100:.1f}% ({int(self.run_term_sum)}/{self.run_done_count})")
+                self.total_reward[episode_done] = 0.0
+
+            #wandb logging: only when an episode finishes
+            if wandb.run is not None and episode_done.any():
+                if not hasattr(self, "_target_round_log"):
+                    self._reset_target_round_log()
+                if not hasattr(self, "_round_step_stats"):
+                    self._reset_round_step_stats()
+
+                record_mask = episode_done & ~self._target_round_log["seen"] #seen means slot is locked until the whole buffer resets
+                if record_mask.any():
+                    self._target_round_log["seen"][record_mask] = True
+                    self._target_round_log["cov"][record_mask] = coverage_fraction[record_mask]
+                    self._target_round_log["term"][record_mask] = terminated[record_mask].float()  # any-time 85% (real success rate), not just ≤400 steps
+                    self._target_round_log["rc"][record_mask] = rc_done_tensor[record_mask]
+                    self._target_round_log["ep_reward"][record_mask] = ep_reward_done_tensor[record_mask]
+                    self._target_round_log["depth"][record_mask] = self.target_depth_per_env[record_mask]
+                    action_steps = self._episode_action_step_count[record_mask].clamp_min(1).unsqueeze(-1)
+                    self._target_round_log["action_abs"][record_mask] = (
+                        self._episode_action_abs_sum[record_mask] / action_steps
+                    )
+                    self._target_round_log["action_clamped"][record_mask] = (
+                        self._episode_action_clamped_sum[record_mask] / action_steps
+                    )
+
+                if self._target_round_log["seen"].all(): # all slots have been filled
+                    # true round-window aggregates — accumulated across every step of every
+                    # env since the last flush (see _reset_round_step_stats), not a single-step
+                    # snapshot. ra_mean still dropped: alpha1=0, so it doesn't affect training.
+                    # rs_mean kept: alpha2 is active (nonzero) — re-add ra_mean here too if
+                    # alpha1 ever gets re-enabled.
+                    st = self._round_step_stats
+                    log_dict = {}
+                    if st["reward_count"] > 0:
+                        log_dict["reward_mean"] = st["reward_sum"] / st["reward_count"]
+                        log_dict["reward_max"]  = st["reward_max"]
+                        log_dict["reward_min"]  = st["reward_min"]
+                    if st["rv_count"] > 0:
+                        log_dict["rv_mean"] = st["rv_sum"] / st["rv_count"]
+                    if st["rs_count"] > 0:
+                        log_dict["rs_mean"] = st["rs_sum"] / st["rs_count"]
+                    if st["r_explore_count"] > 0:
+                        log_dict["r_explore_mean"] = st["r_explore_sum"] / st["r_explore_count"]
+                    if st["rv_on_target_count"] > 0:
+                        log_dict["rv_mean_on_target"] = st["rv_on_target_sum"] / st["rv_on_target_count"]
+                    if st["liver_frac_count"] > 0:
+                        log_dict["liver_frac_mean"] = st["liver_frac_sum"] / st["liver_frac_count"]
+                    if st["shadow_ok_count"] > 0:
+                        log_dict["shadow_ok_frac"] = st["shadow_ok_sum"] / st["shadow_ok_count"]
+                    if st["shadow_fraction_count"] > 0:
+                        log_dict["shadow_fraction"] = st["shadow_fraction_sum"] / st["shadow_fraction_count"]
+                    if st["liver_penalty_count"] > 0:
+                        log_dict["liver_penalty_mean"] = st["liver_penalty_sum"] / st["liver_penalty_count"]
+                    if st["shadow_penalty_count"] > 0:
+                        log_dict["shadow_penalty_mean"] = st["shadow_penalty_sum"] / st["shadow_penalty_count"]
+                    if st["r_end_count"] > 0:
+                        log_dict["r_end_mean_when_fired"] = st["r_end_sum"] / st["r_end_count"]
+
+                    # weighted CONTRIBUTIONS — weight × mean, the actual reward-share each term
+                    # produces (raw rv_mean/rs_mean above are pre-weight, not comparable as-is).
+                    # UNITS DIFFER, watch the suffix: the _per_step ones are a per-agent-step
+                    # rate (paid every step, so multiply by an episode's realized step count to
+                    # compare against an episode total); _per_episode is already a whole-episode
+                    # total (rc only ever makes sense summed over an episode — see rc dilution
+                    # note above). To compare like-for-like: contrib_*_per_step × episode_length.
+                    if st["rs_count"] > 0:
+                        log_dict["contrib_shadow_rs_per_step"] = self.alpha2 * (st["rs_sum"] / st["rs_count"])
+                    if st["rv_count"] > 0:
+                        log_dict["contrib_vis_rv_per_step"] = self.alpha_vis * (st["rv_sum"] / st["rv_count"])
+                    if st["r_explore_count"] > 0:
+                        log_dict["contrib_explore_per_step"] = self.w_explore * (st["r_explore_sum"] / st["r_explore_count"])
+                    log_dict["contrib_coverage_rc_per_episode"] = self.w_coverage * self._target_round_log["rc"].mean().item()
+
+                    log_dict["episode_volume_fraction_mean"] = self._target_round_log["cov"].mean().item()
+                    log_dict["episode_volume_fraction_max"]  = self._target_round_log["cov"].max().item()
+                    log_dict["episode_terminated_frac"]      = self._target_round_log["term"].mean().item()
+                    log_dict["episode_success_count"] = int(self._target_round_log["term"].sum().item())
+                    log_dict["rc_episode_sum_mean"] = self._target_round_log["rc"].mean().item()
+                    log_dict["rc_episode_sum_max"]  = self._target_round_log["rc"].max().item()
+                    log_dict["episode_reward_mean"] = self._target_round_log["ep_reward"].mean().item()
+                    log_dict["episode_reward_max"]  = self._target_round_log["ep_reward"].max().item()
+
+                    for i, patient_id in enumerate(patient_cfg["id_list"]):
+                        env_inds = torch.arange(i, num_envs, n_types, device=self.sim.device)
+                        log_dict[f"episode_volume_fraction/{patient_id}"] = self._target_round_log["cov"][env_inds].mean().item()
+                        log_dict[f"target_depth/{patient_id}"] = self._target_round_log["depth"][env_inds].mean().item()
+                        for action_idx, action_name in enumerate(("tangent_x", "tangent_y", "angle", "roll")):
+                            log_dict[f"action/mean_abs/{patient_id}/{action_name}"] = (
+                                self._target_round_log["action_abs"][env_inds, action_idx].mean().item()
+                            )
+                            log_dict[f"action/clamped_frac/{patient_id}/{action_name}"] = (
+                                self._target_round_log["action_clamped"][env_inds, action_idx].mean().item()
+                            )
+                    if hasattr(self, "target_total_voxels_list"):
+                        # was hardcoded to target_total_voxels_list[0] (patient #0/s0030 only,
+                        # stale/misleading now that each patient has its own target voxel count)
+                        log_dict["target_total_voxels_mean"] = float(np.mean(self.target_total_voxels_list))
+                        for i, patient_id in enumerate(patient_cfg["id_list"]):
+                            log_dict[f"target_total_voxels/{patient_id}"] = self.target_total_voxels_list[i]
+
+                    # depth-curriculum diagnostic: this ROUND's exact result — all 10 envs used
+                    # the SAME depth cutoff (self._current_depth_cutoff, set in _randomize_target
+                    # and held fixed until this flush), so "term" here is literally X out of 10
+                    # envs that succeeded AT THAT DEPTH, this round. One clean data point per
+                    # round, not a slowly-converging running average.
+                    if hasattr(self, "_current_depth_cutoff"):
+                        success_pct_this_round = self._target_round_log["term"].float().mean().item() * 100.0
+                        log_dict[f"success_pct/depth_{int(self._current_depth_cutoff)}"] = success_pct_this_round
+                        # pick the NEXT round's cutoff now, so every env's following resets use it
+                        depth_buckets = scene_cfg.get("target_volume", {}).get("depth_curriculum_voxels", [90])
+                        self._current_depth_cutoff = depth_buckets[int(torch.randint(0, len(depth_buckets), (1,)).item())]
+
+                    # LIVE unthrottled true rate — run_term_sum/run_done_count count EVERY
+                    # episode completion unconditionally (see get_run_metric_summary), unlike
+                    # episode_success_count/episode_terminated_frac above which only bank one
+                    # slot per env per round and so get starved by fast-cycling envs (see the
+                    # conversation this was added from: a 7/7-env round showed 3-4/7 "success"
+                    # while the real, all-episodes rate over the same window was ~74%).
+                    # Previously this true rate only reached wandb as a single end-of-run
+                    # summary scalar (train.py/play.py, wandb.run.summary) — logging it here
+                    # too makes it a live chart, visible even if the run is stopped early.
+                    if self.run_done_count > 0:
+                        log_dict["run_episode_terminated_mean_live"] = self.run_term_sum / self.run_done_count
+                        log_dict["run_completed_episodes_live"] = self.run_done_count
+
+                    wandb.log(log_dict)
+                    self._reset_target_round_log()
+                    self._reset_round_step_stats()
 
         return reward
 
@@ -1937,119 +2203,29 @@ class roboticUSEnv(DirectRLEnv):
             coverage_fraction = torch.zeros(num_envs, device=self.sim.device)
 
         terminated = torch.zeros(num_envs, dtype=torch.bool, device=self.sim.device)
-        terminated |= (coverage_fraction >= 0.80)
-        # success =  80% coverage  400 steps
-        success = (coverage_fraction >= 0.80) & (self.episode_length_buf <= 360)
+        terminated |= (coverage_fraction >= 0.90)
+        # success =  85% coverage  400 steps
+        success = (coverage_fraction >= 0.90) & (self.episode_length_buf <= 360)
 
         time_outs = self.episode_length_buf >= self.max_episode_length - 1
 
         episode_done = terminated | time_outs
 
-        if os.environ.get("SONOGYM_INFERENCE") and episode_done.any():
-            for env_id in episode_done.nonzero(as_tuple=False).squeeze(-1).tolist():
-                outcome = "SUCCESS" if success[env_id] else "TIMEOUT"
-                expected_patient = patient_cfg["id_list"][env_id % n_types]
-                print(f"[EPISODE END] env={env_id} (patient={expected_patient}) | {outcome} | coverage={coverage_fraction[env_id]:.3f} | steps={self.episode_length_buf[env_id].item()}")
-                # proof, not theory: query the LIVE USD stage for whichever mesh is
-                # actually resolved for this env's Human prim right now, and flag it if
-                # it doesn't match the patient env_id is supposed to be running.
-                
-        # rc reset
-        rc_done_tensor = torch.zeros(num_envs, device=self.sim.device)
-        if hasattr(self, "rc_episode_sum") and episode_done.any():
-            rc_done_tensor[episode_done] = self.rc_episode_sum[episode_done]
-            self.rc_episode_sum[episode_done] = 0.0
-       
-        ep_reward_done_tensor = torch.zeros(num_envs, device=self.sim.device)
-        if hasattr(self, "total_reward") and episode_done.any():
-            ep_reward_done_tensor[episode_done] = self.total_reward[episode_done]
+        # [EPISODE END] print moved to _get_rewards() (see the bug-fix note there) —
+        # it now also reports the live, unthrottled running success rate, which needs
+        # self.run_term_sum/run_done_count updated AFTER this step's reward, not here.
 
-        if episode_done.any():
-            done_count = int(episode_done.sum().item())
-            self.run_cov_sum += float(coverage_fraction[episode_done].sum().item())
-            self.run_term_sum += float(success[episode_done].float().sum().item())
-            self.run_ep_reward_sum += float(self.total_reward[episode_done].sum().item())
-            self.run_done_count += done_count
-            self.total_reward[episode_done] = 0.0
-        #wandb logging: only when an episode finishes
-        if wandb.run is not None and episode_done.any():
-            if not hasattr(self, "_target_round_log"):
-                self._reset_target_round_log()
-            if not hasattr(self, "_round_step_stats"):
-                self._reset_round_step_stats()
-
-            record_mask = episode_done & ~self._target_round_log["seen"] #seen means slot is locked until the whole buffer resets
-            if record_mask.any():
-                self._target_round_log["seen"][record_mask] = True
-                self._target_round_log["cov"][record_mask] = coverage_fraction[record_mask]
-                self._target_round_log["term"][record_mask] = terminated[record_mask].float()  # any-time 85% (real success rate), not just ≤400 steps
-                self._target_round_log["rc"][record_mask] = rc_done_tensor[record_mask]
-                self._target_round_log["ep_reward"][record_mask] = ep_reward_done_tensor[record_mask]
-                self._target_round_log["depth"][record_mask] = self.target_depth_per_env[record_mask]
-
-            if self._target_round_log["seen"].all(): # all slots have been filled
-                # true round-window aggregates — accumulated across every step of every
-                # env since the last flush (see _reset_round_step_stats), not a single-step
-                # snapshot. ra_mean still dropped: alpha1=0, so it doesn't affect training.
-                # rs_mean kept: alpha2 is active (nonzero) — re-add ra_mean here too if
-                # alpha1 ever gets re-enabled.
-                st = self._round_step_stats
-                log_dict = {}
-                if st["reward_count"] > 0:
-                    log_dict["reward_mean"] = st["reward_sum"] / st["reward_count"]
-                    log_dict["reward_max"]  = st["reward_max"]
-                    log_dict["reward_min"]  = st["reward_min"]
-                if st["rv_count"] > 0:
-                    log_dict["rv_mean"] = st["rv_sum"] / st["rv_count"]
-                if st["rs_count"] > 0:
-                    log_dict["rs_mean"] = st["rs_sum"] / st["rs_count"]
-                if st["r_explore_count"] > 0:
-                    log_dict["r_explore_mean"] = st["r_explore_sum"] / st["r_explore_count"]
-                if st["rv_on_target_count"] > 0:
-                    log_dict["rv_mean_on_target"] = st["rv_on_target_sum"] / st["rv_on_target_count"]
-                if st["liver_frac_count"] > 0:
-                    log_dict["liver_frac_mean"] = st["liver_frac_sum"] / st["liver_frac_count"]
-                if st["shadow_ok_count"] > 0:
-                    log_dict["shadow_ok_frac"] = st["shadow_ok_sum"] / st["shadow_ok_count"]
-                if st["shadow_fraction_count"] > 0:
-                    log_dict["shadow_fraction"] = st["shadow_fraction_sum"] / st["shadow_fraction_count"]
-
-                log_dict["episode_volume_fraction_mean"] = self._target_round_log["cov"].mean().item()
-                log_dict["episode_volume_fraction_max"]  = self._target_round_log["cov"].max().item()
-                log_dict["episode_terminated_frac"]      = self._target_round_log["term"].mean().item()
-                log_dict["episode_success_count"] = int(self._target_round_log["term"].sum().item())
-                log_dict["rc_episode_sum_mean"] = self._target_round_log["rc"].mean().item()
-                log_dict["rc_episode_sum_max"]  = self._target_round_log["rc"].max().item()
-                log_dict["episode_reward_mean"] = self._target_round_log["ep_reward"].mean().item()
-                log_dict["episode_reward_max"]  = self._target_round_log["ep_reward"].max().item()
-                
-                for i, patient_id in enumerate(patient_cfg["id_list"]):
-                    env_inds = torch.arange(i, num_envs, n_types, device=self.sim.device)
-                    log_dict[f"episode_volume_fraction/{patient_id}"] = self._target_round_log["cov"][env_inds].mean().item()
-        
-                    log_dict[f"target_depth/{patient_id}"] = self._target_round_log["depth"][env_inds].mean().item()
-                if hasattr(self, "target_total_voxels_list"):
-                    # was hardcoded to target_total_voxels_list[0] (patient #0/s0030 only,
-                    # stale/misleading now that each patient has its own target voxel count)
-                    log_dict["target_total_voxels_mean"] = float(np.mean(self.target_total_voxels_list))
-                    for i, patient_id in enumerate(patient_cfg["id_list"]):
-                        log_dict[f"target_total_voxels/{patient_id}"] = self.target_total_voxels_list[i]
-
-                # depth-curriculum diagnostic: this ROUND's exact result — all 10 envs used
-                # the SAME depth cutoff (self._current_depth_cutoff, set in _randomize_target
-                # and held fixed until this flush), so "term" here is literally X out of 10
-                # envs that succeeded AT THAT DEPTH, this round. One clean data point per
-                # round, not a slowly-converging running average.
-                if hasattr(self, "_current_depth_cutoff"):
-                    success_pct_this_round = self._target_round_log["term"].float().mean().item() * 100.0
-                    log_dict[f"success_pct/depth_{int(self._current_depth_cutoff)}"] = success_pct_this_round
-                    # pick the NEXT round's cutoff now, so every env's following resets use it
-                    depth_buckets = scene_cfg.get("target_volume", {}).get("depth_curriculum_voxels", [90])
-                    self._current_depth_cutoff = depth_buckets[int(torch.randint(0, len(depth_buckets), (1,)).item())]
-
-                wandb.log(log_dict)
-                self._reset_target_round_log()
-                self._reset_round_step_stats()
+        # BUG FIX: this used to read/reset self.total_reward and flush the wandb round-log
+        # right here. But IsaacLab's env.step() calls _get_dones() BEFORE _get_rewards()
+        # every step (direct_rl_env.py:390-392) — so reading total_reward here reads it
+        # ONE STEP STALE, missing the very step that just ended the episode (frequently the
+        # step carrying the terminal bonus r_end, since that's what triggers the success in
+        # the first place). Stash what's needed and do the actual read/reset/log at the end
+        # of _get_rewards() instead, which runs AFTER this step's reward has been added.
+        self._pending_episode_done = episode_done
+        self._pending_terminated = terminated
+        self._pending_success = success
+        self._pending_coverage_fraction = coverage_fraction
 
         return terminated, time_outs
 
@@ -2152,6 +2328,9 @@ class roboticUSEnv(DirectRLEnv):
 
         self.frame_buffer[env_ids] = 0.0
         self.pose_buffer[env_ids] = 0.0
+        self._episode_action_abs_sum[env_ids] = 0.0
+        self._episode_action_clamped_sum[env_ids] = 0.0
+        self._episode_action_step_count[env_ids] = 0.0
 
         if hasattr(self, "target_bbox_list"):
             # Randomize immediately for whichever env(s) just finished, scoped to THEIR

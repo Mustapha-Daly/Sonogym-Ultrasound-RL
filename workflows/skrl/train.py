@@ -293,7 +293,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # -----------------------------
     device = env_cfg.sim.device
 
-    # SharedModel handles our dict observation {"image": (B,3,W,H), "pose": (B,12)}
+    # SharedModel handles our dict observation {"image": (B,3,W,H), "pose": (B,12), "target_rel": (B,3)}
     # policy and value share the same CNN+MLP backbone (policy head = actions, value head = scalar)
     models = {}
     _policy_cfg     = agent_cfg.get("models", {}).get("policy", {})
