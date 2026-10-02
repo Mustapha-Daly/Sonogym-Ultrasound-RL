@@ -189,7 +189,7 @@ class SharedModel(GaussianMixin, DeterministicMixin, Model):
         GaussianMixin.__init__(self, clip_actions, clip_log_std, min_log_std, max_log_std, role="policy")
         DeterministicMixin.__init__(self, clip_actions, role="value")
 
-        # CNN input:  3-frame image stack (B, 3, W, H)
+        # CNN input:  image stack (B, C, H, W)
         self.features_extractor = nn.Sequential(
             nn.Conv2d(observation_space['image'].shape[0], 32, kernel_size=8, stride=2), #Stride 2 = half the output size
             nn.ReLU(),
@@ -197,15 +197,13 @@ class SharedModel(GaussianMixin, DeterministicMixin, Model):
             nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1),
             nn.ReLU(),
+            nn.AdaptiveAvgPool2d((16, 8)),   # force feature map to 64×16×8 = 8192 for ANY image size
             nn.Flatten(),
         )
 
-        #  CNN output 
-        with torch.no_grad():
-            img_shape = observation_space['image'].shape  # (3, W, H)
-            dummy = torch.zeros(1, *img_shape)
-            cnn_flat_size = self.features_extractor(dummy).shape[1]
-        self.net_features = nn.Linear(cnn_flat_size, 512) # compression into 512 numbers
+        # AdaptiveAvgPool fixes the flatten to 64×16×8 = 8192 for ANY image size,
+        # so net_features stays ~4.2M params instead of ballooning to ~48.7M
+        self.net_features = nn.Linear(8192, 512)
 
         # MLP  12-value pose history (3 frames × [x, z, angle, roll])
         self.net_pose = nn.Sequential(
