@@ -46,7 +46,7 @@ probe: # Siemens 5C1
   type: convex      # 'linear' or 'convex'
   radius: 62          # mm, only for  convex probe, tells how curved the probe face is, bigger radius means less curved
   fan_angle: 70  # degrees (50–90 common) , how wide the us beam spread out (Philips C6-2 example)
-  depth: 0.16     # meters (matches image height)
+  depth: 0.15     # meters (matches image height)
   near_field: 0.015  #  top arc dead zone; 0.015=small, 0.030=large (hides surface noise)
   
   #Formulas used: 
