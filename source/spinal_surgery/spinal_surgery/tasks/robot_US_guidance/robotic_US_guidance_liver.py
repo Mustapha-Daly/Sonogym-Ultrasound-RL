@@ -868,7 +868,7 @@ class roboticUSEnv(DirectRLEnv):
         liver_np = (label_map.detach().cpu().numpy() == self.cfg.LIVER_LABEL_ID).astype(np.float32)
         kernel_np = kernel.detach().cpu().numpy().astype(np.float32)
         liver_fraction = fftconvolve(liver_np, kernel_np, mode="same") / n_sphere
-        fits_liver = liver_fraction >= 0.99                                # (X, Y, Z) bool, full volume
+        fits_liver = liver_fraction >= 0.90                               # (X, Y, Z) bool, full volume
 
         X, Y, Z = label_map.shape
         y_idx = np.arange(Y).reshape(1, Y, 1)
@@ -1364,7 +1364,15 @@ class roboticUSEnv(DirectRLEnv):
             shadow_ok = torch.ones(num_envs, dtype=torch.bool, device=self.sim.device)
 
         for i in range(n_types):
-            env_inds = torch.arange(i, num_envs, n_types, device=self.sim.device)
+            # BUG FIX: torch.arange(i, num_envs, n_types) raises "upper bound and larger
+            # bound inconsistent with step sign" when i >= num_envs (e.g. teleop/debug runs
+            # with --num_envs < number of patients) — there are simply zero envs of this
+            # patient type in that case, so the correct result is an empty tensor, not a crash.
+            env_inds = (
+                torch.arange(i, num_envs, n_types, device=self.sim.device)
+                if i < num_envs else
+                torch.empty(0, dtype=torch.long, device=self.sim.device)
+            )
             B_i = env_inds.numel()
 
             x_min, x_max, y_min, y_max, z_min, z_max = self.target_bbox_list[i]
@@ -1610,7 +1618,13 @@ class roboticUSEnv(DirectRLEnv):
                     h_idx = int(TARGET_PICK_FRAC[0] * (H_img - 1))
                     w_idx = int(TARGET_PICK_FRAC[1] * (W_img - 1))
 
-                    voxel_at_pick = coords_oriented[0, h_idx, w_idx, 0]
+                    # BUG FIX: self.last_sampled_coords is overwritten on every iteration of
+                    # label_img_slicer's per-human-type loop, including types with zero envs
+                    # (e.g. teleop/debug runs with num_envs < patient count) — whichever type
+                    # ran last "wins" even if its tensor is empty, regardless of whether an
+                    # earlier type actually had valid data this step. Guard before indexing.
+                    if coords_oriented.shape[0] > 0:
+                        voxel_at_pick = coords_oriented[0, h_idx, w_idx, 0]
                     #if not os.environ.get("SONOGYM_INFERENCE"):
                         #print(f"[TARGET PICK] voxel coords at frac={TARGET_PICK_FRAC} "
                               #f"(pixel h={h_idx},w={w_idx} of {H_img}x{W_img}): {voxel_at_pick.tolist()}")
@@ -1952,7 +1966,11 @@ class roboticUSEnv(DirectRLEnv):
             n_types = self.US_slicer.n_human_types
             scanned_total = torch.zeros(B, device=self.sim.device)
             for i, mask in enumerate(self.scanned_target_mask):
-                env_inds = torch.arange(i, B, n_types, device=self.sim.device)
+                env_inds = (
+                    torch.arange(i, B, n_types, device=self.sim.device)
+                    if i < B else
+                    torch.empty(0, dtype=torch.long, device=self.sim.device)
+                )
                 scanned_total[env_inds] = mask[env_inds].sum(dim=(1, 2, 3)).float()
             cov_frac = scanned_total / self.target_total_per_env.clamp(min=1.0) #episode volume mean
             T = self.episode_step_count.clamp(min=1.0) # number of steps in that episode
@@ -2132,6 +2150,8 @@ class roboticUSEnv(DirectRLEnv):
                     log_dict["episode_reward_max"]  = self._target_round_log["ep_reward"].max().item()
 
                     for i, patient_id in enumerate(patient_cfg["id_list"]):
+                        if i >= num_envs:
+                            continue  # no envs of this patient type (e.g. teleop/debug run with num_envs < patient count)
                         env_inds = torch.arange(i, num_envs, n_types, device=self.sim.device)
                         log_dict[f"episode_volume_fraction/{patient_id}"] = self._target_round_log["cov"][env_inds].mean().item()
                         log_dict[f"target_depth/{patient_id}"] = self._target_round_log["depth"][env_inds].mean().item()
@@ -2196,6 +2216,8 @@ class roboticUSEnv(DirectRLEnv):
         if hasattr(self, "scanned_target_mask") and hasattr(self, "target_total_per_env"):
             scanned_total = torch.zeros(num_envs, device=self.sim.device)
             for i, mask in enumerate(self.scanned_target_mask):
+                if i >= num_envs:
+                    continue  # no envs of this patient type (e.g. teleop/debug run with num_envs < patient count)
                 env_inds = torch.arange(i, num_envs, n_types, device=self.sim.device)
                 scanned_total[env_inds] = mask[env_inds].sum(dim=(1, 2, 3)).float()
             coverage_fraction = (scanned_total / self.target_total_per_env.clamp(min=1.0)).clamp(max=1.0)
