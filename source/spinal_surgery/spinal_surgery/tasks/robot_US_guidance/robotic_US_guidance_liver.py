@@ -443,6 +443,9 @@ class roboticUSEnv(DirectRLEnv):
             _slicer.current_x_z_x_angle_cmd = torch.clamp(_slicer.current_x_z_x_angle_cmd, _min, _max)
 
         self.US_slicer.update_cmd = _update_cmd_per_env
+        # kept for the inference action/command diagnostic in _pre_physics_step (boundary checks)
+        self._probe_xz_min = _xz_min
+        self._probe_xz_max = _xz_max
         self._inject_target_volume()
         self.coronal_x_angle_rad = float(
             scene_cfg["motion_planning"].get("coronal_x_angle_rad", 0.5 * np.pi)
@@ -1293,6 +1296,8 @@ class roboticUSEnv(DirectRLEnv):
             shadow_ok = torch.ones(num_envs, dtype=torch.bool, device=self.sim.device)
 
         for i in range(n_types):
+            if i >= num_envs:
+                continue  # no env is assigned this patient type (num_envs < n_types)
             env_inds = torch.arange(i, num_envs, n_types, device=self.sim.device)
             B_i = env_inds.numel()
 
@@ -1517,7 +1522,15 @@ class roboticUSEnv(DirectRLEnv):
                 label_hw = self._orient_convex_hw(label_wh)
                 label_hw = self._apply_superficial_bone_shadow(label_hw)
 
-                if hasattr(self.US_slicer, "last_sampled_coords"):
+                # BUG FIX: last_sampled_coords is overwritten on every iteration of the
+                # per-human-type loop in slice_label_img_planar, including types with
+                # ZERO envs assigned (num_envs < n_human_types) — which leaves it holding
+                # an EMPTY (0, W, H, E, 3) tensor if the last type happens to have no envs.
+                # Guard on a non-empty batch dim before indexing row 0 below.
+                if (
+                    hasattr(self.US_slicer, "last_sampled_coords")
+                    and self.US_slicer.last_sampled_coords.shape[0] > 0
+                ):
                     # last_sampled_coords is (B, W, H, E, 3) — raw orientation, before _orient_convex_hw's
                     # permute+flip. Apply the SAME transform so indices line up with the displayed image.
                     coords_oriented = self.US_slicer.last_sampled_coords.permute(0, 2, 1, 3, 4)  # (B,H,W,E,3)
@@ -1543,7 +1556,7 @@ class roboticUSEnv(DirectRLEnv):
                 if hasattr(self, "target_bbox_list"):
                     self._update_voxel_viz()
 
-                VIZ_EVERY = 5 # matplotlib in lock-step with the probe (slower). Try 2-3 if too slow.
+                VIZ_EVERY = 1 # matplotlib in lock-step with the probe (slower). Try 2-3 if too slow.
                 if self._viz_step % VIZ_EVERY == 0:
                     # pick env 0 for plotting
                     label2d = label_hw[0]  # (H,W)
@@ -1643,9 +1656,12 @@ class roboticUSEnv(DirectRLEnv):
         # update the target command
         # actions = torch.zeros_like(actions).to(self.sim.device)
         # actions[:, 0] = 1
+        raw_actions = actions.clone()  # pre-scale/clamp, for the inference action diagnostic below
+        scaled_actions = None
         if self.action_mode == "continuous":
+            scaled_actions = actions * self.action_scale  # pre-clamp, for clamped_frac diagnostic
             actions = torch.clamp(
-                actions * self.action_scale, -self.max_action, self.max_action
+                scaled_actions, -self.max_action, self.max_action
             )
         elif self.action_mode == "discrete":
             actions = torch.sign(actions) * self.action_scale
@@ -1709,6 +1725,64 @@ class roboticUSEnv(DirectRLEnv):
         # set command to robot
         # set new command
         self.pose_diff_ik_controller.set_command(base_to_ee_target_pose)
+
+        # -------------------------------------------------
+        # Diagnostic: per-step action/command/EE trace (inference only, env 0) — added
+        # to tell apart (a) collapsed/idling policy, (b) action-scale/workspace clamping,
+        # (c) IK/control lag, as the possible cause of "agent parks and stops until
+        # timeout." See chat history for the exact symptom categories this maps to.
+        # -------------------------------------------------
+        if os.environ.get("SONOGYM_INFERENCE") and scaled_actions is not None:
+            dbg_env = 0
+            if not hasattr(self, "_action_dbg_hist"):
+                self._action_dbg_hist = []
+                self._action_dbg_clamp_hits = torch.zeros(4, device=self.sim.device)
+                self._action_dbg_steps = 0
+
+            is_clamped = (scaled_actions[dbg_env] != self.actions[dbg_env])
+            self._action_dbg_clamp_hits += is_clamped.float()
+            self._action_dbg_steps += 1
+            clamped_frac = (self._action_dbg_clamp_hits / self._action_dbg_steps).tolist()
+
+            cmd = self.US_slicer.current_x_z_x_angle_cmd[dbg_env]
+            roll = self.US_slicer.roll_adj[dbg_env, 0]
+            xz_min = self._probe_xz_min[dbg_env]
+            xz_max = self._probe_xz_max[dbg_env]
+            BOUND_EPS = 1e-2
+            at_bound = [
+                bool((cmd[k] - xz_min[k]).abs() < BOUND_EPS or (cmd[k] - xz_max[k]).abs() < BOUND_EPS)
+                for k in range(3)
+            ]
+            roll_at_bound = bool((roll.abs() - self.max_roll_adj).abs() < BOUND_EPS)
+
+            # actual EE (x,z) in human frame vs. this step's freshly commanded (x,z) target
+            ee_target_xz = self.US_slicer.target_position[dbg_env, [0, 2]] * self.US_slicer.label_res
+            ee_actual_xz = human_to_ee_pos[dbg_env, [0, 2]]
+            ee_err = torch.norm(ee_actual_xz - ee_target_xz).item()
+
+            self._action_dbg_hist.append(raw_actions[dbg_env].detach().cpu())
+            if len(self._action_dbg_hist) > 50:
+                self._action_dbg_hist.pop(0)
+
+            print(
+                f"[ACTION DEBUG step {self.num_step}] env={dbg_env} "
+                f"raw={[round(v, 4) for v in raw_actions[dbg_env].tolist()]} "
+                f"scaled={[round(v, 4) for v in scaled_actions[dbg_env].tolist()]} "
+                f"clamped={[round(v, 4) for v in self.actions[dbg_env].tolist()]} "
+                f"is_clamped={is_clamped.tolist()} clamped_frac_running={[round(c, 3) for c in clamped_frac]} "
+                f"cmd(x,z,ang)={[round(v, 3) for v in cmd.tolist()]} roll={roll.item():.4f} "
+                f"at_bound(x,z,ang)={at_bound} roll_at_bound={roll_at_bound} "
+                f"ee_pos_err={ee_err:.5f}"
+            )
+
+            if self._action_dbg_steps % 50 == 0:
+                window = torch.stack(self._action_dbg_hist, dim=0)  # (<=50, 4)
+                print(
+                    f"[ACTION DEBUG ROLLING step {self.num_step}] env={dbg_env} window={window.shape[0]} "
+                    f"raw_mean={[round(v, 4) for v in window.mean(dim=0).tolist()]} "
+                    f"raw_mean_abs={[round(v, 4) for v in window.abs().mean(dim=0).tolist()]} "
+                    f"raw_std={[round(v, 4) for v in window.std(dim=0).tolist()]}"
+                )
 
         # record extras
         self.extras["human_to_ee_pos"] = human_to_ee_pos
@@ -1862,6 +1936,8 @@ class roboticUSEnv(DirectRLEnv):
             n_types = self.US_slicer.n_human_types
             scanned_total = torch.zeros(B, device=self.sim.device)
             for i, mask in enumerate(self.scanned_target_mask):
+                if i >= B:
+                    continue  # no env is assigned this patient type (num_envs < n_types)
                 env_inds = torch.arange(i, B, n_types, device=self.sim.device)
                 scanned_total[env_inds] = mask[env_inds].sum(dim=(1, 2, 3)).float()
             cov_frac = scanned_total / self.target_total_per_env.clamp(min=1.0) #episode volume mean
@@ -1869,9 +1945,9 @@ class roboticUSEnv(DirectRLEnv):
             D = (self.episode_dist_sum / T).clamp(min=0.05)  # avg normalised distance; clamp avoids 1/D explosion
             P = self.episode_rs_sum / T                       # avg shadow-free fraction
             r_end = self.terminal_bonus_kend * (1.0 + self.alpha1 / D + self.alpha2 * P)
-            # add terminal bonus only on first crossing 0.85 (once per episode)
-            just_crossed = (cov_frac >= 0.80) & ~self.reached_95
-            self.reached_95 = self.reached_95 | (cov_frac >= 0.80)
+            # add terminal bonus only on first crossing 0.90 (once per episode)
+            just_crossed = (cov_frac >= 0.90) & ~self.reached_95
+            self.reached_95 = self.reached_95 | (cov_frac >= 0.90)
             reward = reward + torch.where(
                 just_crossed,
                 r_end,
@@ -1930,6 +2006,8 @@ class roboticUSEnv(DirectRLEnv):
         if hasattr(self, "scanned_target_mask") and hasattr(self, "target_total_per_env"):
             scanned_total = torch.zeros(num_envs, device=self.sim.device)
             for i, mask in enumerate(self.scanned_target_mask):
+                if i >= num_envs:
+                    continue  # no env is assigned this patient type (num_envs < n_types)
                 env_inds = torch.arange(i, num_envs, n_types, device=self.sim.device)
                 scanned_total[env_inds] = mask[env_inds].sum(dim=(1, 2, 3)).float()
             coverage_fraction = (scanned_total / self.target_total_per_env.clamp(min=1.0)).clamp(max=1.0)
@@ -1937,23 +2015,20 @@ class roboticUSEnv(DirectRLEnv):
             coverage_fraction = torch.zeros(num_envs, device=self.sim.device)
 
         terminated = torch.zeros(num_envs, dtype=torch.bool, device=self.sim.device)
-        terminated |= (coverage_fraction >= 0.80)
-        # success =  80% coverage  400 steps
-        success = (coverage_fraction >= 0.80) & (self.episode_length_buf <= 360)
+        terminated |= (coverage_fraction >= 0.90)
+        # success =  90% coverage  400 steps
+        success = (coverage_fraction >= 0.90) & (self.episode_length_buf <= 360)
 
         time_outs = self.episode_length_buf >= self.max_episode_length - 1
 
         episode_done = terminated | time_outs
 
-        if os.environ.get("SONOGYM_INFERENCE") and episode_done.any():
-            for env_id in episode_done.nonzero(as_tuple=False).squeeze(-1).tolist():
-                outcome = "SUCCESS" if success[env_id] else "TIMEOUT"
-                expected_patient = patient_cfg["id_list"][env_id % n_types]
-                print(f"[EPISODE END] env={env_id} (patient={expected_patient}) | {outcome} | coverage={coverage_fraction[env_id]:.3f} | steps={self.episode_length_buf[env_id].item()}")
-                # proof, not theory: query the LIVE USD stage for whichever mesh is
-                # actually resolved for this env's Human prim right now, and flag it if
-                # it doesn't match the patient env_id is supposed to be running.
-                
+        # [EPISODE END] print moved below, alongside the run_*_sum counter update — needs
+        # to fire AFTER each individual episode's counters are incremented (not before) so
+        # the printed running rate actually includes that episode, and needs a per-env loop
+        # (not the old batch-only version) so N episodes finishing on the same step each get
+        # their own correctly-numbered [EP n] line instead of being lumped under one count.
+
         # rc reset
         rc_done_tensor = torch.zeros(num_envs, device=self.sim.device)
         if hasattr(self, "rc_episode_sum") and episode_done.any():
@@ -1965,11 +2040,24 @@ class roboticUSEnv(DirectRLEnv):
             ep_reward_done_tensor[episode_done] = self.total_reward[episode_done]
 
         if episode_done.any():
-            done_count = int(episode_done.sum().item())
-            self.run_cov_sum += float(coverage_fraction[episode_done].sum().item())
-            self.run_term_sum += float(success[episode_done].float().sum().item())
-            self.run_ep_reward_sum += float(self.total_reward[episode_done].sum().item())
-            self.run_done_count += done_count
+            # Per-env loop (not a batch sum) so each episode's running rate can be printed
+            # right after IT specifically updates the counters — matters when several envs
+            # finish in the same step, so episode #N's printed rate is truly "after N
+            # episodes," not all of this step's finishers lumped together under one count.
+            inference_mode = os.environ.get("SONOGYM_INFERENCE")
+            for env_id in episode_done.nonzero(as_tuple=False).squeeze(-1).tolist():
+                self.run_done_count += 1
+                self.run_cov_sum += float(coverage_fraction[env_id].item())
+                self.run_term_sum += float(success[env_id].item())
+                self.run_ep_reward_sum += float(self.total_reward[env_id].item())
+                if inference_mode:
+                    outcome = "SUCCESS" if success[env_id] else "TIMEOUT"
+                    expected_patient = patient_cfg["id_list"][env_id % n_types]
+                    running_mean = self.run_term_sum / self.run_done_count
+                    print(f"[EPISODE END] env={env_id} (patient={expected_patient}) | {outcome} | "
+                          f"coverage={coverage_fraction[env_id]:.3f} | steps={self.episode_length_buf[env_id].item()} "
+                          f"|| [EP {self.run_done_count}] running success rate over {self.run_done_count} "
+                          f"episodes: {running_mean*100:.1f}% ({int(self.run_term_sum)}/{self.run_done_count})")
             self.total_reward[episode_done] = 0.0
         #wandb logging: only when an episode finishes
         if wandb.run is not None and episode_done.any():
@@ -2024,6 +2112,8 @@ class roboticUSEnv(DirectRLEnv):
                 log_dict["episode_reward_max"]  = self._target_round_log["ep_reward"].max().item()
                 
                 for i, patient_id in enumerate(patient_cfg["id_list"]):
+                    if i >= num_envs:
+                        continue  # no env is assigned this patient type (num_envs < n_types)
                     env_inds = torch.arange(i, num_envs, n_types, device=self.sim.device)
                     log_dict[f"episode_volume_fraction/{patient_id}"] = self._target_round_log["cov"][env_inds].mean().item()
         
@@ -2047,6 +2137,17 @@ class roboticUSEnv(DirectRLEnv):
                     depth_buckets = scene_cfg.get("target_volume", {}).get("depth_curriculum_voxels", [90])
                     self._current_depth_cutoff = depth_buckets[int(torch.randint(0, len(depth_buckets), (1,)).item())]
 
+                # LIVE unthrottled true success rate — run_term_sum/run_done_count count
+                # EVERY episode completion unconditionally (see get_run_metric_summary),
+                # unlike episode_success_count/episode_terminated_frac above which only bank
+                # one slot per env per round and so get starved by fast-cycling envs/patients
+                # (a round can look like 3-4/7 "success" while the real, all-episodes rate
+                # over the same window is much higher). This makes that true rate a live
+                # chart during inference instead of only a final end-of-run summary scalar.
+                if self.run_done_count > 0:
+                    log_dict["run_episode_terminated_mean_live"] = self.run_term_sum / self.run_done_count
+                    log_dict["run_completed_episodes_live"] = self.run_done_count
+
                 wandb.log(log_dict)
                 self._reset_target_round_log()
                 self._reset_round_step_stats()
@@ -2068,9 +2169,24 @@ class roboticUSEnv(DirectRLEnv):
         self,
         human_ee_target_pos: torch.Tensor,
         human_ee_target_quat: torch.Tensor,
+        env_ids: Sequence[int] | None = None,
         num_steps: int = 200,
     ):
+        # NOTE: human_ee_target_pos/quat and the whole IK solve below stay FULL-BATCH,
+        # same as the original implementation. self.pose_diff_ik_controller is a single
+        # shared DifferentialIKController whose internal buffers (_command, ee_pos_des,
+        # ee_quat_des) are pre-allocated at num_envs and never resized — feeding it a
+        # smaller batch doesn't shrink them, it SILENTLY BROADCASTS the smaller command
+        # into the full buffer (set_command does `self._command[:] = command`), then
+        # later compute() compares that broadcast-filled (num_envs, 4) quat buffer
+        # against our deliberately-sliced (len(env_ids), 4) current-pose quat and crashes
+        # with a shape mismatch (or worse, silently corrupts the other envs' IK targets
+        # when shapes happen to be broadcastable). So the IK math must stay full-batch.
+        # The ONLY thing actually scoped to env_ids is the final joint-target WRITE,
+        # which IS designed to take an env_ids slice.
         is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
+        if env_ids is None:
+            env_ids = self.robot._ALL_INDICES
 
         for _ in range(num_steps):
             self._sim_step_counter += 1
@@ -2126,8 +2242,12 @@ class roboticUSEnv(DirectRLEnv):
             joint_pos_des = self.pose_diff_ik_controller.compute(
                 US_ee_pos_b, US_ee_quat_b, US_jacobian, US_joint_pos
             )
+            # BUG FIX: only WRITE the joint target for the env(s) actually resetting —
+            # joint_pos_des is computed full-batch (required, see note above) but the
+            # write must stay scoped or every other env's actuator target gets yanked
+            # to this reset's IK solution too.
             self.robot.set_joint_position_target(
-                joint_pos_des, joint_ids=self.robot_entity_cfg.joint_ids
+                joint_pos_des[env_ids], joint_ids=self.robot_entity_cfg.joint_ids, env_ids=env_ids
             )
 
             # set actions into simulator
@@ -2198,10 +2318,14 @@ class roboticUSEnv(DirectRLEnv):
             self.episode_rs_sum[env_ids]     = 0.0
             self.episode_step_count[env_ids] = 0.0
 
-        joint_pos = self.robot.data.default_joint_pos.clone()
-        joint_vel = self.robot.data.default_joint_vel.clone()
-        self.robot.write_joint_state_to_sim(joint_pos, joint_vel)
-        self.robot.reset()
+        # BUG FIX: neither call below was scoped to env_ids — default_joint_pos/vel were
+        # the FULL (num_envs, n_joints) tensors and write_joint_state_to_sim/reset() were
+        # called with no env_ids kwarg, meaning every env's robot joints got reset to
+        # default whenever ANY single env finished, not just the one that actually did.
+        joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
+        joint_vel = self.robot.data.default_joint_vel[env_ids].clone()
+        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+        self.robot.reset(env_ids=env_ids)
 
         self.pose_diff_ik_controller.reset()
 
@@ -2280,9 +2404,15 @@ class roboticUSEnv(DirectRLEnv):
         cmd_target_poses = cmd_target_poses * (max_init - min_init) + min_init
         cmd_target_poses = self._lock_cmd_to_plane_angle(cmd_target_poses)
         # compute 3d target poses
-        self.US_slicer.update_cmd(
-            cmd_target_poses - self.US_slicer.current_x_z_x_angle_cmd
-        )
+        # BUG FIX: update_cmd adds its argument to current_x_z_x_angle_cmd UNMASKED, for
+        # every env. Passing (cmd_target_poses - current_x_z_x_angle_cmd) for the FULL
+        # batch meant every env's probe command got yanked to a brand-new random position
+        # whenever ANY single env finished — including envs still mid-episode, physically
+        # disrupting their trajectory out from under the policy. Zero the delta for every
+        # env except the ones actually resetting, so untouched envs get a true no-op.
+        cmd_delta = torch.zeros((self.scene.num_envs, 3), device=self.sim.device)
+        cmd_delta[env_ids] = cmd_target_poses[env_ids] - self.US_slicer.current_x_z_x_angle_cmd[env_ids]
+        self.US_slicer.update_cmd(cmd_delta)
         roll_init = float(scene_cfg["motion_planning"].get("roll_init", 0.0))
         self.US_slicer.roll_adj[env_ids] = roll_init
 
@@ -2299,6 +2429,7 @@ class roboticUSEnv(DirectRLEnv):
         self._move_towards_target(
             self.US_slicer.human_to_ee_target_pos,
             self.US_slicer.human_to_ee_target_quat,
+            env_ids=env_ids,
         )
 
         # init distance to goal
@@ -2322,7 +2453,14 @@ class roboticUSEnv(DirectRLEnv):
             self.cur_cmd_pose[:, 2:3] - self.goal_cmd_pose[:, 2:3], dim=-1
         )
 
-        self.total_reward = torch.zeros(self.scene.num_envs, device=self.sim.device)
+        # BUG FIX: this used to unconditionally reassign the WHOLE tensor to zeros, wiping
+        # every env's accumulated episode reward whenever ANY single env reset — not just
+        # the one that finished. This is also the only place self.total_reward is ever
+        # created, so the first-ever call (env_ids == all envs) still needs to initialize it.
+        if not hasattr(self, "total_reward"):
+            self.total_reward = torch.zeros(self.scene.num_envs, device=self.sim.device)
+        else:
+            self.total_reward[env_ids] = 0.0
 
         # record infor
         self.extras["human_to_ee_pos"] = cur_human_ee_pos
