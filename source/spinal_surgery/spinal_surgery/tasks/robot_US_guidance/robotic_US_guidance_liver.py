@@ -443,6 +443,9 @@ class roboticUSEnv(DirectRLEnv):
             _slicer.current_x_z_x_angle_cmd = torch.clamp(_slicer.current_x_z_x_angle_cmd, _min, _max)
 
         self.US_slicer.update_cmd = _update_cmd_per_env
+        # kept for the inference action/command diagnostic in _pre_physics_step (boundary checks)
+        self._probe_xz_min = _xz_min
+        self._probe_xz_max = _xz_max
         self._inject_target_volume()
         self.coronal_x_angle_rad = float(
             scene_cfg["motion_planning"].get("coronal_x_angle_rad", 0.5 * np.pi)
@@ -868,7 +871,7 @@ class roboticUSEnv(DirectRLEnv):
         liver_np = (label_map.detach().cpu().numpy() == self.cfg.LIVER_LABEL_ID).astype(np.float32)
         kernel_np = kernel.detach().cpu().numpy().astype(np.float32)
         liver_fraction = fftconvolve(liver_np, kernel_np, mode="same") / n_sphere
-        fits_liver = liver_fraction >= 0.90                               # (X, Y, Z) bool, full volume
+        fits_liver = liver_fraction >= 0.99                              # (X, Y, Z) bool, full volume
 
         X, Y, Z = label_map.shape
         y_idx = np.arange(Y).reshape(1, Y, 1)
@@ -1737,6 +1740,7 @@ class roboticUSEnv(DirectRLEnv):
         # update the target command
         # actions = torch.zeros_like(actions).to(self.sim.device)
         # actions[:, 0] = 1
+        raw_actions = actions.clone()  # pre-scale/clamp, for the inference action diagnostic below
         if self.action_mode == "continuous":
             unclamped_actions = actions * self.action_scale
             actions = torch.clamp(
@@ -1813,6 +1817,64 @@ class roboticUSEnv(DirectRLEnv):
         # set command to robot
         # set new command
         self.pose_diff_ik_controller.set_command(base_to_ee_target_pose)
+
+        # -------------------------------------------------
+        # Diagnostic: per-step action/command/EE trace (inference only, env 0) — added
+        # to tell apart (a) collapsed/idling policy, (b) action-scale/workspace clamping,
+        # (c) IK/control lag, as the possible cause of "agent parks and stops until
+        # timeout." See chat history for the exact symptom categories this maps to.
+        # -------------------------------------------------
+        if os.environ.get("SONOGYM_INFERENCE"):
+            dbg_env = 0
+            if not hasattr(self, "_action_dbg_hist"):
+                self._action_dbg_hist = []
+                self._action_dbg_clamp_hits = torch.zeros(4, device=self.sim.device)
+                self._action_dbg_steps = 0
+
+            is_clamped = (unclamped_actions[dbg_env] != self.actions[dbg_env])
+            self._action_dbg_clamp_hits += is_clamped.float()
+            self._action_dbg_steps += 1
+            clamped_frac = (self._action_dbg_clamp_hits / self._action_dbg_steps).tolist()
+
+            cmd = self.US_slicer.current_x_z_x_angle_cmd[dbg_env]
+            roll = self.US_slicer.roll_adj[dbg_env, 0]
+            xz_min = self._probe_xz_min[dbg_env]
+            xz_max = self._probe_xz_max[dbg_env]
+            BOUND_EPS = 1e-2
+            at_bound = [
+                bool((cmd[k] - xz_min[k]).abs() < BOUND_EPS or (cmd[k] - xz_max[k]).abs() < BOUND_EPS)
+                for k in range(3)
+            ]
+            roll_at_bound = bool((roll.abs() - self.max_roll_adj).abs() < BOUND_EPS)
+
+            # actual EE (x,z) in human frame vs. this step's freshly commanded (x,z) target
+            ee_target_xz = self.US_slicer.target_position[dbg_env, [0, 2]] * self.US_slicer.label_res
+            ee_actual_xz = human_to_ee_pos[dbg_env, [0, 2]]
+            ee_err = torch.norm(ee_actual_xz - ee_target_xz).item()
+
+            self._action_dbg_hist.append(raw_actions[dbg_env].detach().cpu())
+            if len(self._action_dbg_hist) > 50:
+                self._action_dbg_hist.pop(0)
+
+            print(
+                f"[ACTION DEBUG step {self.num_step}] env={dbg_env} "
+                f"raw={[round(v, 4) for v in raw_actions[dbg_env].tolist()]} "
+                f"scaled={[round(v, 4) for v in unclamped_actions[dbg_env].tolist()]} "
+                f"clamped={[round(v, 4) for v in self.actions[dbg_env].tolist()]} "
+                f"is_clamped={is_clamped.tolist()} clamped_frac_running={[round(c, 3) for c in clamped_frac]} "
+                f"cmd(x,z,ang)={[round(v, 3) for v in cmd.tolist()]} roll={roll.item():.4f} "
+                f"at_bound(x,z,ang)={at_bound} roll_at_bound={roll_at_bound} "
+                f"ee_pos_err={ee_err:.5f}"
+            )
+
+            if self._action_dbg_steps % 50 == 0:
+                window = torch.stack(self._action_dbg_hist, dim=0)  # (<=50, 4)
+                print(
+                    f"[ACTION DEBUG ROLLING step {self.num_step}] env={dbg_env} window={window.shape[0]} "
+                    f"raw_mean={[round(v, 4) for v in window.mean(dim=0).tolist()]} "
+                    f"raw_mean_abs={[round(v, 4) for v in window.abs().mean(dim=0).tolist()]} "
+                    f"raw_std={[round(v, 4) for v in window.std(dim=0).tolist()]}"
+                )
 
         # record extras
         self.extras["human_to_ee_pos"] = human_to_ee_pos
@@ -1981,7 +2043,7 @@ class roboticUSEnv(DirectRLEnv):
             just_crossed = (cov_frac >= 0.90) & ~self.reached_95
             self.reached_95 = self.reached_95 | (cov_frac >= 0.90)
             reward = reward + torch.where(
-                just_crossed,
+                just_crossed, 
                 r_end,
                 torch.zeros(B, device=self.sim.device),
             )
@@ -2226,7 +2288,7 @@ class roboticUSEnv(DirectRLEnv):
 
         terminated = torch.zeros(num_envs, dtype=torch.bool, device=self.sim.device)
         terminated |= (coverage_fraction >= 0.90)
-        # success =  85% coverage  400 steps
+        # success =  90% coverage  400 steps
         success = (coverage_fraction >= 0.90) & (self.episode_length_buf <= 360)
 
         time_outs = self.episode_length_buf >= self.max_episode_length - 1
@@ -2266,9 +2328,24 @@ class roboticUSEnv(DirectRLEnv):
         self,
         human_ee_target_pos: torch.Tensor,
         human_ee_target_quat: torch.Tensor,
+        env_ids: Sequence[int] | None = None,
         num_steps: int = 200,
     ):
+        # NOTE: human_ee_target_pos/quat and the whole IK solve below stay FULL-BATCH,
+        # same as the original implementation. self.pose_diff_ik_controller is a single
+        # shared DifferentialIKController whose internal buffers (_command, ee_pos_des,
+        # ee_quat_des) are pre-allocated at num_envs and never resized — feeding it a
+        # smaller batch doesn't shrink them, it SILENTLY BROADCASTS the smaller command
+        # into the full buffer (set_command does `self._command[:] = command`), then
+        # later compute() compares that broadcast-filled (num_envs, 4) quat buffer
+        # against our deliberately-sliced (len(env_ids), 4) current-pose quat and crashes
+        # with a shape mismatch (or worse, silently corrupts the other envs' IK targets
+        # when shapes happen to be broadcastable). So the IK math must stay full-batch.
+        # The ONLY thing actually scoped to env_ids is the final joint-target WRITE,
+        # which IS designed to take an env_ids slice.
         is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
+        if env_ids is None:
+            env_ids = self.robot._ALL_INDICES
 
         for _ in range(num_steps):
             self._sim_step_counter += 1
@@ -2324,8 +2401,12 @@ class roboticUSEnv(DirectRLEnv):
             joint_pos_des = self.pose_diff_ik_controller.compute(
                 US_ee_pos_b, US_ee_quat_b, US_jacobian, US_joint_pos
             )
+            # BUG FIX: only WRITE the joint target for the env(s) actually resetting —
+            # joint_pos_des is computed full-batch (required, see note above) but the
+            # write must stay scoped or every other env's actuator target gets yanked
+            # to this reset's IK solution too.
             self.robot.set_joint_position_target(
-                joint_pos_des, joint_ids=self.robot_entity_cfg.joint_ids
+                joint_pos_des[env_ids], joint_ids=self.robot_entity_cfg.joint_ids, env_ids=env_ids
             )
 
             # set actions into simulator
@@ -2399,10 +2480,14 @@ class roboticUSEnv(DirectRLEnv):
             self.episode_rs_sum[env_ids]     = 0.0
             self.episode_step_count[env_ids] = 0.0
 
-        joint_pos = self.robot.data.default_joint_pos.clone()
-        joint_vel = self.robot.data.default_joint_vel.clone()
-        self.robot.write_joint_state_to_sim(joint_pos, joint_vel)
-        self.robot.reset()
+        # BUG FIX: neither call below was scoped to env_ids — default_joint_pos/vel were
+        # the FULL (num_envs, n_joints) tensors and write_joint_state_to_sim/reset() were
+        # called with no env_ids kwarg, meaning every env's robot joints got reset to
+        # default whenever ANY single env finished, not just the one that actually did.
+        joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
+        joint_vel = self.robot.data.default_joint_vel[env_ids].clone()
+        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+        self.robot.reset(env_ids=env_ids)
 
         self.pose_diff_ik_controller.reset()
 
@@ -2481,9 +2566,15 @@ class roboticUSEnv(DirectRLEnv):
         cmd_target_poses = cmd_target_poses * (max_init - min_init) + min_init
         cmd_target_poses = self._lock_cmd_to_plane_angle(cmd_target_poses)
         # compute 3d target poses
-        self.US_slicer.update_cmd(
-            cmd_target_poses - self.US_slicer.current_x_z_x_angle_cmd
-        )
+        # BUG FIX: update_cmd adds its argument to current_x_z_x_angle_cmd UNMASKED, for
+        # every env. Passing (cmd_target_poses - current_x_z_x_angle_cmd) for the FULL
+        # batch meant every env's probe command got yanked to a brand-new random position
+        # whenever ANY single env finished — including envs still mid-episode, physically
+        # disrupting their trajectory out from under the policy. Zero the delta for every
+        # env except the ones actually resetting, so untouched envs get a true no-op.
+        cmd_delta = torch.zeros((self.scene.num_envs, 3), device=self.sim.device)
+        cmd_delta[env_ids] = cmd_target_poses[env_ids] - self.US_slicer.current_x_z_x_angle_cmd[env_ids]
+        self.US_slicer.update_cmd(cmd_delta)
         roll_init = float(scene_cfg["motion_planning"].get("roll_init", 0.0))
         self.US_slicer.roll_adj[env_ids] = roll_init
 
@@ -2500,6 +2591,7 @@ class roboticUSEnv(DirectRLEnv):
         self._move_towards_target(
             self.US_slicer.human_to_ee_target_pos,
             self.US_slicer.human_to_ee_target_quat,
+            env_ids=env_ids,
         )
 
         # init distance to goal
@@ -2523,7 +2615,14 @@ class roboticUSEnv(DirectRLEnv):
             self.cur_cmd_pose[:, 2:3] - self.goal_cmd_pose[:, 2:3], dim=-1
         )
 
-        self.total_reward = torch.zeros(self.scene.num_envs, device=self.sim.device)
+        # BUG FIX: this used to unconditionally reassign the WHOLE tensor to zeros, wiping
+        # every env's accumulated episode reward whenever ANY single env reset — not just
+        # the one that finished. This is also the only place self.total_reward is ever
+        # created, so the first-ever call (env_ids == all envs) still needs to initialize it.
+        if not hasattr(self, "total_reward"):
+            self.total_reward = torch.zeros(self.scene.num_envs, device=self.sim.device)
+        else:
+            self.total_reward[env_ids] = 0.0
 
         # record infor
         self.extras["human_to_ee_pos"] = cur_human_ee_pos
