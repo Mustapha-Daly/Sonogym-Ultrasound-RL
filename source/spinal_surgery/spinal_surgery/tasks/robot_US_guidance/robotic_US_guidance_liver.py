@@ -443,9 +443,6 @@ class roboticUSEnv(DirectRLEnv):
             _slicer.current_x_z_x_angle_cmd = torch.clamp(_slicer.current_x_z_x_angle_cmd, _min, _max)
 
         self.US_slicer.update_cmd = _update_cmd_per_env
-        # kept for the inference action/command diagnostic in _pre_physics_step (boundary checks)
-        self._probe_xz_min = _xz_min
-        self._probe_xz_max = _xz_max
         self._inject_target_volume()
         self.coronal_x_angle_rad = float(
             scene_cfg["motion_planning"].get("coronal_x_angle_rad", 0.5 * np.pi)
@@ -1656,12 +1653,9 @@ class roboticUSEnv(DirectRLEnv):
         # update the target command
         # actions = torch.zeros_like(actions).to(self.sim.device)
         # actions[:, 0] = 1
-        raw_actions = actions.clone()  # pre-scale/clamp, for the inference action diagnostic below
-        scaled_actions = None
         if self.action_mode == "continuous":
-            scaled_actions = actions * self.action_scale  # pre-clamp, for clamped_frac diagnostic
             actions = torch.clamp(
-                scaled_actions, -self.max_action, self.max_action
+                actions * self.action_scale, -self.max_action, self.max_action
             )
         elif self.action_mode == "discrete":
             actions = torch.sign(actions) * self.action_scale
@@ -1725,64 +1719,6 @@ class roboticUSEnv(DirectRLEnv):
         # set command to robot
         # set new command
         self.pose_diff_ik_controller.set_command(base_to_ee_target_pose)
-
-        # -------------------------------------------------
-        # Diagnostic: per-step action/command/EE trace (inference only, env 0) — added
-        # to tell apart (a) collapsed/idling policy, (b) action-scale/workspace clamping,
-        # (c) IK/control lag, as the possible cause of "agent parks and stops until
-        # timeout." See chat history for the exact symptom categories this maps to.
-        # -------------------------------------------------
-        if os.environ.get("SONOGYM_INFERENCE") and scaled_actions is not None:
-            dbg_env = 0
-            if not hasattr(self, "_action_dbg_hist"):
-                self._action_dbg_hist = []
-                self._action_dbg_clamp_hits = torch.zeros(4, device=self.sim.device)
-                self._action_dbg_steps = 0
-
-            is_clamped = (scaled_actions[dbg_env] != self.actions[dbg_env])
-            self._action_dbg_clamp_hits += is_clamped.float()
-            self._action_dbg_steps += 1
-            clamped_frac = (self._action_dbg_clamp_hits / self._action_dbg_steps).tolist()
-
-            cmd = self.US_slicer.current_x_z_x_angle_cmd[dbg_env]
-            roll = self.US_slicer.roll_adj[dbg_env, 0]
-            xz_min = self._probe_xz_min[dbg_env]
-            xz_max = self._probe_xz_max[dbg_env]
-            BOUND_EPS = 1e-2
-            at_bound = [
-                bool((cmd[k] - xz_min[k]).abs() < BOUND_EPS or (cmd[k] - xz_max[k]).abs() < BOUND_EPS)
-                for k in range(3)
-            ]
-            roll_at_bound = bool((roll.abs() - self.max_roll_adj).abs() < BOUND_EPS)
-
-            # actual EE (x,z) in human frame vs. this step's freshly commanded (x,z) target
-            ee_target_xz = self.US_slicer.target_position[dbg_env, [0, 2]] * self.US_slicer.label_res
-            ee_actual_xz = human_to_ee_pos[dbg_env, [0, 2]]
-            ee_err = torch.norm(ee_actual_xz - ee_target_xz).item()
-
-            self._action_dbg_hist.append(raw_actions[dbg_env].detach().cpu())
-            if len(self._action_dbg_hist) > 50:
-                self._action_dbg_hist.pop(0)
-
-            print(
-                f"[ACTION DEBUG step {self.num_step}] env={dbg_env} "
-                f"raw={[round(v, 4) for v in raw_actions[dbg_env].tolist()]} "
-                f"scaled={[round(v, 4) for v in scaled_actions[dbg_env].tolist()]} "
-                f"clamped={[round(v, 4) for v in self.actions[dbg_env].tolist()]} "
-                f"is_clamped={is_clamped.tolist()} clamped_frac_running={[round(c, 3) for c in clamped_frac]} "
-                f"cmd(x,z,ang)={[round(v, 3) for v in cmd.tolist()]} roll={roll.item():.4f} "
-                f"at_bound(x,z,ang)={at_bound} roll_at_bound={roll_at_bound} "
-                f"ee_pos_err={ee_err:.5f}"
-            )
-
-            if self._action_dbg_steps % 50 == 0:
-                window = torch.stack(self._action_dbg_hist, dim=0)  # (<=50, 4)
-                print(
-                    f"[ACTION DEBUG ROLLING step {self.num_step}] env={dbg_env} window={window.shape[0]} "
-                    f"raw_mean={[round(v, 4) for v in window.mean(dim=0).tolist()]} "
-                    f"raw_mean_abs={[round(v, 4) for v in window.abs().mean(dim=0).tolist()]} "
-                    f"raw_std={[round(v, 4) for v in window.std(dim=0).tolist()]}"
-                )
 
         # record extras
         self.extras["human_to_ee_pos"] = human_to_ee_pos
@@ -2148,7 +2084,13 @@ class roboticUSEnv(DirectRLEnv):
                     log_dict["run_episode_terminated_mean_live"] = self.run_term_sum / self.run_done_count
                     log_dict["run_completed_episodes_live"] = self.run_done_count
 
-                wandb.log(log_dict)
+                wandb.log(log_dict, step=self.num_step)
+                # mirror to a local TensorBoard writer too, if play.py attached one for
+                # this inference session (see workflows/skrl/play.py) — same real step,
+                # no reconstruction needed since it's written correctly the first time.
+                if hasattr(self, "_inference_tb_writer"):
+                    for k, v in log_dict.items():
+                        self._inference_tb_writer.add_scalar(k, v, self.num_step)
                 self._reset_target_round_log()
                 self._reset_round_step_stats()
 

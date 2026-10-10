@@ -11,7 +11,7 @@ cd ~/IsaacLab
 PYTHONPATH=$HOME/ws/sonogym/SonoGym/source/spinal_surgery:$PYTHONPATH \
   ./isaaclab.sh -p ~/ws/sonogym/SonoGym/workflows/skrl/play.py \
   --task Isaac-robot-US-guidance-v0 \
-  --checkpoint ~/IsaacLab/logs/skrl/US_guidance/2026-09-09_20-17-37_ppo_torch_PPO_US/checkpoints/best_agent.pt \
+  --checkpoint ~/IsaacLab/logs/skrl/US_guidance/2026-10-09_11-42-51_ppo_torch_PPO_US/checkpoints/best_agent.pt \
   --num_envs 7 \
   --enable_cameras \
   --noise_k 0.0
@@ -64,6 +64,7 @@ parser.add_argument(
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 parser.add_argument("--num_steps", type=int, default=0, help="Stop after this many steps (0 = run forever).")
 parser.add_argument("--noise_k", type=float, default=1.0, help="Noise blend: action = mean + k*(sample-mean). 0=deterministic (pure mean), 1=full stochastic.")
+parser.add_argument("--seed", type=int, default=None, help="Seed for the environment (e.g. target randomization) — pass the same value across two play.py runs to compare checkpoints on an identical sequence of targets/inits.")
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -114,6 +115,7 @@ import spinal_surgery
 from isaaclab_tasks.utils import get_checkpoint_path, load_cfg_from_registry, parse_env_cfg
 from spinal_surgery.lab.agents.skrl_actor_critic import SharedModel
 import wandb
+from torch.utils.tensorboard import SummaryWriter
 
 # PLACEHOLDER: Extension template (do not remove this comment)
 
@@ -131,6 +133,11 @@ def main():
     env_cfg = parse_env_cfg(
         args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs, use_fabric=not args_cli.disable_fabric
     )
+    # seed handling (same pattern as train.py) — set BEFORE env creation so target
+    # randomization draws from a reproducible RNG state, letting two checkpoints be
+    # compared on an identical sequence of targets/init conditions.
+    if args_cli.seed is not None:
+        env_cfg.seed = args_cli.seed
     try:
         experiment_cfg = load_cfg_from_registry(args_cli.task, f"skrl_{algorithm}_cfg_entry_point")
     except ValueError:
@@ -194,6 +201,17 @@ def main():
 
     # handle to the raw IsaacLab env (for probe-pose printing in the loop below)
     _raw_env = env.unwrapped
+
+    # local TensorBoard writer for this inference session — mirrors every field the env
+    # already wandb.logs (coverage, success rate, shadow/liver fractions, etc.) using the
+    # same real step count (self.num_step), no reconstruction needed. Lives alongside the
+    # checkpoint's training run so it shows up next to the training curves in TensorBoard.
+    _experiment_dir = os.path.dirname(os.path.dirname(resume_path))  # .../checkpoints/x.pt -> run dir
+    _inference_tb_dir = os.path.join(
+        _experiment_dir, f"inference_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
+    )
+    _raw_env._inference_tb_writer = SummaryWriter(_inference_tb_dir)
+    print(f"[INFO] Inference TensorBoard log: {_inference_tb_dir}")
 
     # wrap around environment for skrl
     env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)  # same as: `wrap_env(env, wrapper="auto")`
@@ -306,6 +324,9 @@ def main():
             wandb.run.summary["run_completed_episodes"] = int(run_summary["run_completed_episodes"])
             print(f"[INFO] Inference run summary: {run_summary}")
         wandb.finish()
+
+    if hasattr(_raw_env, "_inference_tb_writer"):
+        _raw_env._inference_tb_writer.close()
 
     # close the simulator
     env.close()
