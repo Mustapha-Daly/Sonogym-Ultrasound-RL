@@ -443,9 +443,6 @@ class roboticUSEnv(DirectRLEnv):
             _slicer.current_x_z_x_angle_cmd = torch.clamp(_slicer.current_x_z_x_angle_cmd, _min, _max)
 
         self.US_slicer.update_cmd = _update_cmd_per_env
-        # kept for the inference action/command diagnostic in _pre_physics_step (boundary checks)
-        self._probe_xz_min = _xz_min
-        self._probe_xz_max = _xz_max
         self._inject_target_volume()
         self.coronal_x_angle_rad = float(
             scene_cfg["motion_planning"].get("coronal_x_angle_rad", 0.5 * np.pi)
@@ -1169,6 +1166,7 @@ class roboticUSEnv(DirectRLEnv):
             "rc": torch.zeros(num_envs, device=self.sim.device),
             "ep_reward": torch.zeros(num_envs, device=self.sim.device),
             "depth": torch.zeros(num_envs, device=self.sim.device),  # NEW: target depth (cy) that episode used
+            "episode_length": torch.zeros(num_envs, device=self.sim.device),  # steps taken by that completed episode
             "action_abs": torch.zeros(num_envs, self.cfg.action_space, device=self.sim.device),
             "action_clamped": torch.zeros(num_envs, self.cfg.action_space, device=self.sim.device),
         }
@@ -1236,6 +1234,7 @@ class roboticUSEnv(DirectRLEnv):
         self.run_cov_sum = 0.0
         self.run_term_sum = 0.0
         self.run_ep_reward_sum = 0.0
+        self.run_length_sum = 0.0
         self.run_done_count = 0
         self._reset_target_round_log()
         self._reset_round_step_stats()
@@ -1640,7 +1639,7 @@ class roboticUSEnv(DirectRLEnv):
                 if hasattr(self, "target_bbox_list"):
                     self._update_voxel_viz()
 
-                VIZ_EVERY = 5 # matplotlib in lock-step with the probe (slower). Try 2-3 if too slow.
+                VIZ_EVERY = 1 # matplotlib in lock-step with the probe (slower). Try 2-3 if too slow.
                 if self._viz_step % VIZ_EVERY == 0:
                     # pick env 0 for plotting
                     label2d = label_hw[0]  # (H,W)
@@ -1740,7 +1739,6 @@ class roboticUSEnv(DirectRLEnv):
         # update the target command
         # actions = torch.zeros_like(actions).to(self.sim.device)
         # actions[:, 0] = 1
-        raw_actions = actions.clone()  # pre-scale/clamp, for the inference action diagnostic below
         if self.action_mode == "continuous":
             unclamped_actions = actions * self.action_scale
             actions = torch.clamp(
@@ -1817,64 +1815,6 @@ class roboticUSEnv(DirectRLEnv):
         # set command to robot
         # set new command
         self.pose_diff_ik_controller.set_command(base_to_ee_target_pose)
-
-        # -------------------------------------------------
-        # Diagnostic: per-step action/command/EE trace (inference only, env 0) — added
-        # to tell apart (a) collapsed/idling policy, (b) action-scale/workspace clamping,
-        # (c) IK/control lag, as the possible cause of "agent parks and stops until
-        # timeout." See chat history for the exact symptom categories this maps to.
-        # -------------------------------------------------
-        if os.environ.get("SONOGYM_INFERENCE"):
-            dbg_env = 0
-            if not hasattr(self, "_action_dbg_hist"):
-                self._action_dbg_hist = []
-                self._action_dbg_clamp_hits = torch.zeros(4, device=self.sim.device)
-                self._action_dbg_steps = 0
-
-            is_clamped = (unclamped_actions[dbg_env] != self.actions[dbg_env])
-            self._action_dbg_clamp_hits += is_clamped.float()
-            self._action_dbg_steps += 1
-            clamped_frac = (self._action_dbg_clamp_hits / self._action_dbg_steps).tolist()
-
-            cmd = self.US_slicer.current_x_z_x_angle_cmd[dbg_env]
-            roll = self.US_slicer.roll_adj[dbg_env, 0]
-            xz_min = self._probe_xz_min[dbg_env]
-            xz_max = self._probe_xz_max[dbg_env]
-            BOUND_EPS = 1e-2
-            at_bound = [
-                bool((cmd[k] - xz_min[k]).abs() < BOUND_EPS or (cmd[k] - xz_max[k]).abs() < BOUND_EPS)
-                for k in range(3)
-            ]
-            roll_at_bound = bool((roll.abs() - self.max_roll_adj).abs() < BOUND_EPS)
-
-            # actual EE (x,z) in human frame vs. this step's freshly commanded (x,z) target
-            ee_target_xz = self.US_slicer.target_position[dbg_env, [0, 2]] * self.US_slicer.label_res
-            ee_actual_xz = human_to_ee_pos[dbg_env, [0, 2]]
-            ee_err = torch.norm(ee_actual_xz - ee_target_xz).item()
-
-            self._action_dbg_hist.append(raw_actions[dbg_env].detach().cpu())
-            if len(self._action_dbg_hist) > 50:
-                self._action_dbg_hist.pop(0)
-
-            print(
-                f"[ACTION DEBUG step {self.num_step}] env={dbg_env} "
-                f"raw={[round(v, 4) for v in raw_actions[dbg_env].tolist()]} "
-                f"scaled={[round(v, 4) for v in unclamped_actions[dbg_env].tolist()]} "
-                f"clamped={[round(v, 4) for v in self.actions[dbg_env].tolist()]} "
-                f"is_clamped={is_clamped.tolist()} clamped_frac_running={[round(c, 3) for c in clamped_frac]} "
-                f"cmd(x,z,ang)={[round(v, 3) for v in cmd.tolist()]} roll={roll.item():.4f} "
-                f"at_bound(x,z,ang)={at_bound} roll_at_bound={roll_at_bound} "
-                f"ee_pos_err={ee_err:.5f}"
-            )
-
-            if self._action_dbg_steps % 50 == 0:
-                window = torch.stack(self._action_dbg_hist, dim=0)  # (<=50, 4)
-                print(
-                    f"[ACTION DEBUG ROLLING step {self.num_step}] env={dbg_env} window={window.shape[0]} "
-                    f"raw_mean={[round(v, 4) for v in window.mean(dim=0).tolist()]} "
-                    f"raw_mean_abs={[round(v, 4) for v in window.abs().mean(dim=0).tolist()]} "
-                    f"raw_std={[round(v, 4) for v in window.std(dim=0).tolist()]}"
-                )
 
         # record extras
         self.extras["human_to_ee_pos"] = human_to_ee_pos
@@ -2121,14 +2061,18 @@ class roboticUSEnv(DirectRLEnv):
                     self.run_cov_sum += float(coverage_fraction[env_id].item())
                     self.run_term_sum += float(success[env_id].item())
                     self.run_ep_reward_sum += float(self.total_reward[env_id].item())
+                    self.run_length_sum += float(self.episode_length_buf[env_id].item())
                     if inference_mode:
                         outcome = "SUCCESS" if success[env_id] else "TIMEOUT"
                         expected_patient = patient_cfg["id_list"][env_id % n_types]
                         running_mean = self.run_term_sum / self.run_done_count
+                        running_cov = self.run_cov_sum / self.run_done_count
+                        running_len = self.run_length_sum / self.run_done_count
                         print(f"[EPISODE END] env={env_id} (patient={expected_patient}) | {outcome} | "
                               f"coverage={coverage_fraction[env_id]:.3f} | steps={self.episode_length_buf[env_id].item()} "
                               f"|| [EP {self.run_done_count}] running success rate over {self.run_done_count} "
-                              f"episodes: {running_mean*100:.1f}% ({int(self.run_term_sum)}/{self.run_done_count})")
+                              f"episodes: {running_mean*100:.1f}% ({int(self.run_term_sum)}/{self.run_done_count}) "
+                              f"| mean coverage: {running_cov*100:.1f}% | mean episode length: {running_len:.1f} steps")
                 self.total_reward[episode_done] = 0.0
 
             #wandb logging: only when an episode finishes
@@ -2146,6 +2090,10 @@ class roboticUSEnv(DirectRLEnv):
                     self._target_round_log["rc"][record_mask] = rc_done_tensor[record_mask]
                     self._target_round_log["ep_reward"][record_mask] = ep_reward_done_tensor[record_mask]
                     self._target_round_log["depth"][record_mask] = self.target_depth_per_env[record_mask]
+                    # episode_length_buf still holds this episode's final step count here —
+                    # _reset_idx (which would zero it for a fresh episode) hasn't run yet,
+                    # same timing the console "steps=" print already relies on.
+                    self._target_round_log["episode_length"][record_mask] = self.episode_length_buf[record_mask].float()
                     action_steps = self._episode_action_step_count[record_mask].clamp_min(1).unsqueeze(-1)
                     self._target_round_log["action_abs"][record_mask] = (
                         self._episode_action_abs_sum[record_mask] / action_steps
@@ -2204,6 +2152,9 @@ class roboticUSEnv(DirectRLEnv):
 
                     log_dict["episode_volume_fraction_mean"] = self._target_round_log["cov"].mean().item()
                     log_dict["episode_volume_fraction_max"]  = self._target_round_log["cov"].max().item()
+                    log_dict["episode_length_mean"] = self._target_round_log["episode_length"].mean().item()
+                    log_dict["episode_length_max"]  = self._target_round_log["episode_length"].max().item()
+                    log_dict["episode_length_min"]  = self._target_round_log["episode_length"].min().item()
                     log_dict["episode_terminated_frac"]      = self._target_round_log["term"].mean().item()
                     log_dict["episode_success_count"] = int(self._target_round_log["term"].sum().item())
                     log_dict["rc_episode_sum_mean"] = self._target_round_log["rc"].mean().item()
@@ -2255,8 +2206,21 @@ class roboticUSEnv(DirectRLEnv):
                     if self.run_done_count > 0:
                         log_dict["run_episode_terminated_mean_live"] = self.run_term_sum / self.run_done_count
                         log_dict["run_completed_episodes_live"] = self.run_done_count
+                        # same unthrottled-over-ALL-episodes treatment for coverage and episode
+                        # length — episode_volume_fraction_mean/episode_length_mean above are
+                        # still just the last-round 7-sample snapshot (same throttling bias as
+                        # episode_terminated_frac), these are the true running means instead.
+                        log_dict["run_episode_volume_fraction_mean_live"] = self.run_cov_sum / self.run_done_count
+                        log_dict["run_episode_length_mean_live"] = self.run_length_sum / self.run_done_count
 
                     wandb.log(log_dict)
+                    # mirror the exact same scalars into the local inference TensorBoard
+                    # writer (created in play.py, attached as self._inference_tb_writer) —
+                    # the writer object existed before but nothing ever called add_scalar()
+                    # on it, so every inference run's TB file was just an empty header.
+                    if hasattr(self, "_inference_tb_writer"):
+                        for k, v in log_dict.items():
+                            self._inference_tb_writer.add_scalar(k, v, self.num_step)
                     self._reset_target_round_log()
                     self._reset_round_step_stats()
 
@@ -2288,8 +2252,12 @@ class roboticUSEnv(DirectRLEnv):
 
         terminated = torch.zeros(num_envs, dtype=torch.bool, device=self.sim.device)
         terminated |= (coverage_fraction >= 0.90)
-        # success =  90% coverage  400 steps
-        success = (coverage_fraction >= 0.90) & (self.episode_length_buf <= 360)
+        # success = 90% coverage reached before the episode's own timeout — reference
+        # self.max_episode_length (not a hardcoded step count) so this can't silently go
+        # stale if sim.episode_length is ever changed again (it was hardcoded "360" here
+        # while sim.episode_length got halved to produce 180 steps, which would have made
+        # this comparison trivially always-true against the wrong number).
+        success = (coverage_fraction >= 0.90) & (self.episode_length_buf <= self.max_episode_length)
 
         time_outs = self.episode_length_buf >= self.max_episode_length - 1
 
@@ -2321,6 +2289,7 @@ class roboticUSEnv(DirectRLEnv):
             "run_episode_volume_fraction_mean": self.run_cov_sum / self.run_done_count,
             "run_episode_terminated_mean": self.run_term_sum / self.run_done_count,
             "run_episode_reward_mean": self.run_ep_reward_sum / self.run_done_count,
+            "run_episode_length_mean": self.run_length_sum / self.run_done_count,
             "run_completed_episodes": float(self.run_done_count),
         }
  

@@ -58,7 +58,7 @@ memory:
 # https://skrl.readthedocs.io/en/latest/api/agents/ppo.html
 agent:
   class: PPO
-  rollouts: 360 # must match episode length in sim which is 720 currently
+  rollouts: 360 
   learning_epochs: 4 # match paper exactly now: reuses the buffer 4 times, 720×4 envs/5 = 576 samples/epoch
   mini_batches: 5 # buffer = 720 × 10 = 7200 samples (was × 8 pre-multi-patient). mini_batches=12
   # was tuned for the old 8-env buffer → 480 samples/minibatch; at 10 envs that same 12 gives
